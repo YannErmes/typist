@@ -1,15 +1,15 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import 'graph_model.dart';
 import 'storage.dart';
+import 'tag_sheet.dart';
 import 'theme.dart';
 
 /// Free-writing surface.
 ///
-/// Typing `@word` lists children of `word`; typing `#word` lists parents.
-/// The dropdown is an Overlay anchored with CompositedTransformFollower near
-/// the text cursor. Left click drills down into children, right click copies.
+/// Finish a word after `@` / `#` (at least 2 letters, matching a known
+/// word) and the mind-map slides up as a bottom sheet, focused on that
+/// word — pick what you need and copy it straight from the graph.
 class SheetView extends StatefulWidget {
   final StorageService storage;
   final WordGraph graph;
@@ -29,20 +29,14 @@ class SheetView extends StatefulWidget {
 class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   late final TextEditingController _controller;
   late final FocusNode _focusNode;
-  final LayerLink _layerLink = LayerLink();
-  final GlobalKey _fieldKey = GlobalKey();
   final Debouncer _saver = Debouncer(const Duration(milliseconds: 500));
 
   bool _loaded = false;
 
-  // Popup state — a small navigable graph, never auto-inserts into the sheet.
-  OverlayEntry? _overlay;
-  String? _triggerMode; // '@' children or '#' parents
-  String _rootWord = '';
-  List<String> _navStack = []; // drill path; last = currently shown word
-  List<String> _items = [];
-  Offset _dropdownOffset = const Offset(0, 60);
-  double _editorWidth = 600;
+  // Bottom-sheet session for the current tag.
+  bool _sheetOpen = false;
+  ValueNotifier<String>? _focusNote;
+  String? _autoKey; // last "mode:word" opened or dismissed
 
   @override
   void initState() {
@@ -68,7 +62,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     // Save when the app closes / view is torn down so nothing is lost.
     widget.storage.saveSheet(_controller.text);
     _saver.dispose();
-    _removeOverlay();
+    _focusNote?.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _controller.dispose();
     _focusNode.dispose();
@@ -91,9 +85,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _updateLookup();
   }
 
-  void _onSelectionChanged() => _updateLookup();
-
-  // ---- Trigger detection ----
+  // ---- Tag detection (@word / #word before the cursor) ----
   ({String mode, String word})? _detectTrigger() {
     final text = _controller.text;
     final sel = _controller.selection;
@@ -110,7 +102,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     // Sigil must start a token (start or whitespace/newline before it).
     if (i > 0 && !_isBoundary(text[i - 1])) return null;
     final word = text.substring(i + 1, cursor).toLowerCase();
-    if (word.isEmpty) return null;
     return (mode: sigil, word: word);
   }
 
@@ -119,337 +110,208 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       ch == ' ' || ch == '\n' || ch == '\t' || ch == '(' || ch == '"';
 
   void _updateLookup() {
-    if (!_loaded) return;
-    final trig = _detectTrigger();
-    if (trig == null) {
-      _removeOverlay();
+    if (!_loaded || _sheetOpen) {
+      // While the sheet is open, keep it focused on the tag being typed.
+      if (_sheetOpen) _refocusFromTag();
       return;
     }
-    final mode = trig.mode;
-    final word = trig.word;
-    // New root typed -> reset navigation.
-    if (mode != _triggerMode || word != _rootWord) {
-      _triggerMode = mode;
-      _rootWord = word;
-      _navStack = [word];
-      _items = mode == '@'
-          ? widget.graph.childrenOf(word)
-          : widget.graph.parentsOf(word);
-    } else {
-      // Same root: refresh in case graph changed elsewhere.
-      if (_navStack.length == 1) {
-        _items = mode == '@'
-            ? widget.graph.childrenOf(word)
-            : widget.graph.parentsOf(word);
-      } else {
-        _items = widget.graph.childrenOf(_navStack.last);
-      }
+    final trig = _detectTrigger();
+    if (trig == null) {
+      _autoKey = null;
+      return;
     }
-    _estimateCaretOffset();
-    _showOrUpdateOverlay();
+    if (trig.word.length < 2) return; // let the word be finished first
+    if (widget.graph.get(trig.word) == null) return; // still partial
+    final key = '${trig.mode}:${trig.word}';
+    if (key == _autoKey) return; // already shown / dismissed for this tag
+    _autoKey = key;
+    _openTagSheet(trig.mode, trig.word);
   }
 
-  // Approximate the caret position so the follower sits next to the cursor.
-  void _estimateCaretOffset() {
-    try {
-      final ctx = _fieldKey.currentContext;
-      if (ctx != null) {
-        final box = ctx.findRenderObject() as RenderBox?;
-        if (box != null) _editorWidth = box.size.width;
-      }
-      const lineHeight = 26.0;
-      const charWidth = 8.2;
-      final cursor = _controller.selection.baseOffset
-          .clamp(0, _controller.text.length);
-      final before = _controller.text.substring(0, cursor);
-      final lines = before.split('\n');
-      final line = lines.length - 1;
-      final col = lines.isEmpty ? 0 : lines.last.length;
-      double x = 12 + col * charWidth;
-      x = x.clamp(12, (_editorWidth - 280).clamp(12, 1e6)).toDouble();
-      final y = 12 + (line + 1) * lineHeight;
-      _dropdownOffset = Offset(x, y);
-    } catch (_) {
-      _dropdownOffset = const Offset(12, 60);
-    }
+  /// While the sheet stays open, follow the tag if it becomes another word.
+  void _refocusFromTag() {
+    final trig = _detectTrigger();
+    if (trig == null || trig.word.length < 2) return;
+    if (widget.graph.get(trig.word) == null) return;
+    final key = '${trig.mode}:${trig.word}';
+    _autoKey = key;
+    if (_focusNote?.value != trig.word) _focusNote?.value = trig.word;
   }
 
-  // ---- Overlay ----
-  void _showOrUpdateOverlay() {
-    _removeOverlay();
-    final overlay = Overlay.of(context);
-    _overlay = OverlayEntry(builder: (context) {
-      return CompositedTransformFollower(
-        link: _layerLink,
-        showWhenUnlinked: false,
-        offset: _dropdownOffset,
-        child: Material(
-          elevation: 2,
-          color: Colors.transparent,
-          child: _buildDropdown(),
+  void _openTagSheet(String mode, String word) {
+    _sheetOpen = true;
+    _focusNote = ValueNotifier(word);
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      enableDrag: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Padding(
+        padding:
+            EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+        child: SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.78,
+          child: TagGraphSheet(
+            storage: widget.storage,
+            graph: widget.graph,
+            mode: mode,
+            focus: _focusNote!,
+            onGraphChanged: widget.onGraphChanged,
+          ),
         ),
-      );
-    });
-    overlay.insert(_overlay!);
-  }
-
-  void _refreshOverlay() {
-    _overlay?.markNeedsBuild();
-  }
-
-  void _removeOverlay() {
-    _overlay?.remove();
-    _overlay = null;
-  }
-
-  // ---- Dropdown interactions ----
-  void _drillDown(String word) {
-    // Left click: show words linked UNDER that word (its children).
-    final kids = widget.graph.childrenOf(word);
-    if (kids.isEmpty) return; // nothing below -> do nothing at all.
-    setState(() {
-      _navStack = [..._navStack, word.toLowerCase()];
-      _items = kids;
-    });
-    _refreshOverlay();
-  }
-
-  void _goBack() {
-    if (_navStack.length <= 1) return;
-    final next = _navStack.sublist(0, _navStack.length - 1);
-    final showing = next.last;
-    List<String> items;
-    if (next.length == 1) {
-      items = _triggerMode == '@'
-          ? widget.graph.childrenOf(showing)
-          : widget.graph.parentsOf(showing);
-    } else {
-      items = widget.graph.childrenOf(showing);
-    }
-    setState(() {
-      _navStack = next;
-      _items = items;
-    });
-    _refreshOverlay();
-  }
-
-  void _copyWord(String word) {
-    Clipboard.setData(ClipboardData(text: word));
-    if (mounted) {
-      ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Copied "$word" — paste it manually where you like.'),
-          duration: const Duration(seconds: 2),
-        ),
-      );
-    }
-  }
-
-  Widget _buildDropdown() {
-    final showing = _navStack.isEmpty ? _rootWord : _navStack.last;
-    final kindLabel = _navStack.length <= 1
-        ? (_triggerMode == '@' ? 'children of' : 'parents of')
-        : 'children of';
-    return Container(
-      width: 260,
-      constraints: const BoxConstraints(maxHeight: 320),
-      decoration: BoxDecoration(
-        color: PaperTheme.surface,
-        border: Border.all(color: PaperTheme.line),
-        borderRadius: BorderRadius.circular(6),
       ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Container(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-            decoration: const BoxDecoration(
-              color: PaperTheme.card,
-              borderRadius: BorderRadius.vertical(top: Radius.circular(6)),
-            ),
-            child: Row(
-              children: [
-                if (_navStack.length > 1)
-                  InkWell(
-                    onTap: _goBack,
-                    child: const Padding(
-                      padding: EdgeInsets.only(right: 6),
-                      child: Icon(Icons.arrow_back,
-                          size: 16, color: PaperTheme.inkSoft),
-                    ),
-                  ),
-                Expanded(
-                  child: Text(
-                    '$kindLabel "$showing"',
-                    style: const TextStyle(
-                      color: PaperTheme.ink,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w600,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-                InkWell(
-                  onTap: _removeOverlay,
-                  child: const Icon(Icons.close,
-                      size: 16, color: PaperTheme.inkSoft),
-                ),
-              ],
-            ),
-          ),
-          if (_navStack.length > 1)
-            Padding(
-              padding:
-                  const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              child: Text(
-                _navStack.join(' › '),
+    ).then((_) {
+      _sheetOpen = false;
+      _focusNote?.dispose();
+      _focusNote = null;
+      // Hand the keyboard straight back so writing continues.
+      if (mounted) _focusNode.requestFocus();
+    });
+  }
+
+  /// Called by the shell when the graph changes; the open sheet reads the
+  /// same live graph object, so there is nothing to refresh here.
+  void refreshGraph() {}
+
+  /// Insert "@" or "#" at the cursor (toolbar buttons).
+  /// If the cursor sits on a finished word, open its map instead.
+  void _onSigilButton(String sigil) {
+    final trig = _detectTrigger();
+    if (trig != null &&
+        trig.word.length >= 2 &&
+        widget.graph.get(trig.word) != null) {
+      _autoKey = null; // deliberate re-open, even for the same tag
+      _updateLookup();
+      return;
+    }
+    _insertSigil(sigil);
+  }
+
+  void _insertSigil(String sigil) {
+    final text = _controller.text;
+    final sel = _controller.selection;
+    final cursor =
+        sel.isValid ? sel.baseOffset.clamp(0, text.length) : text.length;
+    final next =
+        '${text.substring(0, cursor)}$sigil${text.substring(cursor)}';
+    _controller.value = TextEditingValue(
+      text: next,
+      selection: TextSelection.collapsed(offset: cursor + 1),
+    );
+    _focusNode.requestFocus();
+  }
+
+  Widget _sigilButton(String label, String hint, VoidCallback onTap) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(14),
+      child: Container(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+        decoration: BoxDecoration(
+          color: PaperTheme.surface,
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(14),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(label,
                 style: const TextStyle(
-                    color: PaperTheme.inkSoft, fontSize: 11),
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          Flexible(
-            child: _items.isEmpty
-                ? const Padding(
-                    padding: EdgeInsets.all(12),
-                    child: Text(
-                      'No words here yet.\nAdd them in the Graph view.',
-                      style: TextStyle(
-                          color: PaperTheme.inkSoft, fontSize: 12),
-                    ),
-                  )
-                : ListView.builder(
-                    shrinkWrap: true,
-                    itemCount: _items.length,
-                    itemBuilder: (context, i) {
-                      final w = _items[i];
-                      final hasKids =
-                          widget.graph.childrenOf(w).isNotEmpty;
-                      return GestureDetector(
-                        // Left click drills down, never inserts text.
-                        onTap: () => _drillDown(w),
-                        // Right click copies for manual pasting.
-                        onSecondaryTap: () => _copyWord(w),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 8),
-                          decoration: const BoxDecoration(
-                            border: Border(
-                              bottom: BorderSide(
-                                  color: PaperTheme.lineThin, width: 0.5),
-                            ),
-                          ),
-                          child: Row(
-                            children: [
-                              Expanded(
-                                child: Text(
-                                  w,
-                                  style: const TextStyle(
-                                    color: PaperTheme.ink,
-                                    fontSize: 14,
-                                  ),
-                                ),
-                              ),
-                              if (hasKids)
-                                const Icon(Icons.chevron_right,
-                                    size: 16,
-                                    color: PaperTheme.inkSoft),
-                              InkWell(
-                                onTap: () => _copyWord(w),
-                                child: const Padding(
-                                  padding: EdgeInsets.only(left: 6),
-                                  child: Icon(Icons.copy,
-                                      size: 14,
-                                      color: PaperTheme.inkSoft),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                  ),
-          ),
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            child: Text(
-              'Left-click: explore deeper · Right-click: copy',
-              style:
-                  TextStyle(color: PaperTheme.inkSoft, fontSize: 10),
-            ),
-          ),
-        ],
+                    color: PaperTheme.ink,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700)),
+            const SizedBox(width: 4),
+            Text(hint,
+                style: const TextStyle(
+                    color: PaperTheme.inkSoft, fontSize: 10.5)),
+          ],
+        ),
       ),
     );
   }
 
-  /// Called by the shell when the graph changes so an open popup refreshes.
-  void refreshGraph() {
-    if (_overlay != null) _updateLookup();
-  }
-
   @override
   Widget build(BuildContext context) {
-    return CompositedTransformTarget(
-      link: _layerLink,
-      child: Container(
-        color: PaperTheme.paper,
-        padding: const EdgeInsets.all(24),
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 760),
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 28, vertical: 24),
-              decoration: BoxDecoration(
-                // Subtle paper card over the paper background.
-                color: const Color(0xFFEFE8D6),
-                border:
-                    Border.all(color: PaperTheme.lineThin, width: 1),
-                borderRadius: BorderRadius.circular(4),
-              ),
-              child: !_loaded
-                  ? const Center(
-                      child: Padding(
-                        padding: EdgeInsets.all(32),
-                        child: SizedBox(
-                          width: 22,
-                          height: 22,
-                          child: CircularProgressIndicator(
-                              strokeWidth: 2),
-                        ),
-                      ),
-                    )
-                  : TextField(
-                      key: _fieldKey,
-                      controller: _controller,
-                      focusNode: _focusNode,
-                      autofocus: true,
-                      maxLines: null,
-                      minLines: 18,
-                      expands: false,
-                      keyboardType: TextInputType.multiline,
-                      onChanged: (_) => _onTextChanged(),
-                      onTap: _onSelectionChanged,
-                      onTapOutside: (_) => _removeOverlay(),
-                      style: const TextStyle(
-                        color: PaperTheme.ink,
-                        fontSize: 16,
-                        height: 1.6,
-                        fontFamily: 'Georgia',
-                      ),
-                      cursorColor: PaperTheme.ink,
-                      decoration: const InputDecoration(
-                        hintText:
-                            'Write freely…\n\nType @eat for children, #eat for parents.',
-                        hintStyle: TextStyle(
-                            color: PaperTheme.inkSoft, fontSize: 14),
-                        border: InputBorder.none,
+    return Container(
+      color: PaperTheme.paper,
+      padding: const EdgeInsets.all(24),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: Container(
+            padding: const EdgeInsets.symmetric(
+                horizontal: 28, vertical: 18),
+            decoration: BoxDecoration(
+              // Subtle paper card over the paper background.
+              color: const Color(0xFFEFE8D6),
+              border:
+                  Border.all(color: PaperTheme.lineThin, width: 1),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Row(
+                  children: [
+                    _sigilButton(
+                        '@', 'children', () => _onSigilButton('@')),
+                    const SizedBox(width: 8),
+                    _sigilButton(
+                        '#', 'parents', () => _onSigilButton('#')),
+                    const Spacer(),
+                    const Text(
+                      'finish the word — its map slides up',
+                      style: TextStyle(
+                          color: PaperTheme.inkSoft, fontSize: 10.5),
+                    ),
+                  ],
+                ),
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 10),
+                  child: Divider(
+                      height: 1, color: PaperTheme.lineThin),
+                ),
+                if (!_loaded)
+                  const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(32),
+                      child: SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2),
                       ),
                     ),
+                  )
+                else
+                  TextField(
+                    controller: _controller,
+                    focusNode: _focusNode,
+                    autofocus: true,
+                    maxLines: null,
+                    minLines: 18,
+                    expands: false,
+                    keyboardType: TextInputType.multiline,
+                    onChanged: (_) => _onTextChanged(),
+                    onTap: _updateLookup,
+                    style: const TextStyle(
+                      color: PaperTheme.ink,
+                      fontSize: 16,
+                      height: 1.6,
+                      fontFamily: 'Georgia',
+                    ),
+                    cursorColor: PaperTheme.ink,
+                    decoration: const InputDecoration(
+                      hintText:
+                          'Write freely…\n\nType @eat and the map of eat slides up — pick a word and copy it.',
+                      hintStyle: TextStyle(
+                          color: PaperTheme.inkSoft, fontSize: 14),
+                      border: InputBorder.none,
+                    ),
+                  ),
+              ],
             ),
           ),
         ),

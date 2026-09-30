@@ -15,24 +15,38 @@ class StorageService {
   Directory? get baseDir => _base;
   String get basePath => _base?.path ?? '';
 
+  /// In-memory preview text used when no file folder is available
+  /// (e.g. running in a browser to preview the UI).
+  String _memorySheet = '';
+
+  /// True when running without a real folder (browser preview).
+  bool get isMemoryOnly => _base == null;
+
   Future<void> init() async {
-    final docs = await getApplicationDocumentsDirectory();
-    _base = Directory('${docs.path}${Platform.pathSeparator}WordGraphTool');
-    _wordsDir = Directory(
-        '${_base!.path}${Platform.pathSeparator}words');
-    await _base!.create(recursive: true);
-    await _wordsDir!.create(recursive: true);
-    _sheetFile = File(
-        '${_base!.path}${Platform.pathSeparator}sheet.txt');
-    if (!await _sheetFile!.exists()) {
-      await _sheetFile!.writeAsString('');
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      _base = Directory('${docs.path}${Platform.pathSeparator}WordGraphTool');
+      _wordsDir = Directory(
+          '${_base!.path}${Platform.pathSeparator}words');
+      await _base!.create(recursive: true);
+      await _wordsDir!.create(recursive: true);
+      _sheetFile = File(
+          '${_base!.path}${Platform.pathSeparator}sheet.txt');
+      if (!await _sheetFile!.exists()) {
+        await _sheetFile!.writeAsString('');
+      }
+    } catch (_) {
+      // No documents folder (e.g. web preview): keep everything in memory.
+      _base = null;
+      _wordsDir = null;
+      _sheetFile = null;
     }
   }
 
   // ---- Sheet ----
   Future<String> loadSheet() async {
+    if (_sheetFile == null) return _memorySheet;
     try {
-      if (_sheetFile == null) return '';
       if (!await _sheetFile!.exists()) return '';
       return await _sheetFile!.readAsString();
     } catch (_) {
@@ -41,8 +55,11 @@ class StorageService {
   }
 
   Future<void> saveSheet(String text) async {
+    if (_sheetFile == null) {
+      _memorySheet = text;
+      return;
+    }
     try {
-      if (_sheetFile == null) return;
       await _sheetFile!.writeAsString(text);
     } catch (_) {
       // Silent: never interrupt typing for IO errors.
