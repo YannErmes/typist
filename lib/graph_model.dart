@@ -1,18 +1,19 @@
-/// In-memory word graph. A word can have many parents and many children,
-/// so this is a graph, not a strict tree.
+/// In-memory word network. Words are free nodes on a mind-map canvas;
+/// links between them are plain undirected connections (no hierarchy).
 class WordNode {
   String name;
-  Set<String> parents;
-  Set<String> children;
+  Set<String> links;
 
-  /// Saved canvas position (mind-map placement). Null = auto-place.
+  /// Saved canvas position. Null = auto-place.
   double? x;
   double? y;
 
+  /// Saved card color as ARGB int. Null = default paper.
+  int? color;
+
   WordNode(this.name,
-      {Set<String>? parents, Set<String>? children, this.x, this.y})
-      : parents = parents ?? <String>{},
-        children = children ?? <String>{};
+      {Set<String>? links, this.x, this.y, this.color})
+      : links = links ?? <String>{};
 
   bool get hasPos => x != null && y != null;
 }
@@ -34,35 +35,53 @@ class WordGraph {
     return keys;
   }
 
-  /// Link [parent] -> [child] (parent above, child below). Creates nodes.
-  void linkParentChild(String parentRaw, String childRaw) {
-    final p = norm(parentRaw);
-    final c = norm(childRaw);
-    if (p.isEmpty || c.isEmpty || p == c) return;
-    final pn = ensure(p);
-    final cn = ensure(c);
-    pn.name = pn.name.isEmpty ? p : pn.name;
-    cn.name = cn.name.isEmpty ? c : cn.name;
-    pn.children.add(cn.name.toLowerCase() == cn.name ? cn.name : norm(cn.name));
-    // Keep keys/refs normalized to lowercase for stable file round-trips.
-    pn.children.removeWhere((e) => e.isEmpty);
-    cn.parents.add(norm(pn.name));
-    _normalizeRefs(pn);
-    _normalizeRefs(cn);
+  /// Connect two words (undirected). Creates missing nodes.
+  void connect(String aRaw, String bRaw) {
+    final a = norm(aRaw);
+    final b = norm(bRaw);
+    if (a.isEmpty || b.isEmpty || a == b) return;
+    final an = ensure(a);
+    final bn = ensure(b);
+    an.links.add(norm(bn.name));
+    bn.links.add(norm(an.name));
+    _scrub(an);
+    _scrub(bn);
   }
 
-  void _normalizeRefs(WordNode n) {
-    n.parents = n.parents.map(norm).where((e) => e.isNotEmpty).toSet();
-    n.children = n.children.map(norm).where((e) => e.isNotEmpty).toSet();
-    n.parents.remove(norm(n.name));
-    n.children.remove(norm(n.name));
+  void _scrub(WordNode n) {
+    n.links =
+        n.links.map(norm).where((e) => e.isNotEmpty).toSet();
+    n.links.remove(norm(n.name));
   }
 
-  void unlinkParentChild(String parentRaw, String childRaw) {
-    final p = get(parentRaw);
-    final c = get(childRaw);
-    p?.children.remove(norm(childRaw));
-    c?.parents.remove(norm(parentRaw));
+  bool linked(String aRaw, String bRaw) {
+    final a = get(aRaw);
+    if (a == null) return false;
+    return a.links.contains(norm(bRaw));
+  }
+
+  void disconnect(String aRaw, String bRaw) {
+    get(aRaw)?.links.remove(norm(bRaw));
+    get(bRaw)?.links.remove(norm(aRaw));
+  }
+
+  /// Rename a word, keeping its links, position and color.
+  /// Returns false when the name is taken or invalid.
+  bool rename(String oldRaw, String newRaw) {
+    final oldKey = norm(oldRaw);
+    final newKey = norm(newRaw);
+    if (oldKey.isEmpty || newKey.isEmpty || oldKey == newKey) {
+      return false;
+    }
+    if (nodes.containsKey(newKey)) return false;
+    final node = nodes.remove(oldKey);
+    if (node == null) return false;
+    node.name = newRaw.trim();
+    nodes[newKey] = node;
+    for (final n in nodes.values) {
+      if (n.links.remove(oldKey)) n.links.add(newKey);
+    }
+    return true;
   }
 
   /// Delete a word entirely and scrub references to it.
@@ -70,22 +89,14 @@ class WordGraph {
     final key = norm(rawName);
     nodes.remove(key);
     for (final n in nodes.values) {
-      n.parents.remove(key);
-      n.children.remove(key);
+      n.links.remove(key);
     }
   }
 
-  List<String> childrenOf(String rawName) {
+  List<String> neighborsOf(String rawName) {
     final n = get(rawName);
     if (n == null) return const [];
-    final list = n.children.toList()..sort();
-    return list;
-  }
-
-  List<String> parentsOf(String rawName) {
-    final n = get(rawName);
-    if (n == null) return const [];
-    final list = n.parents.toList()..sort();
+    final list = n.links.toList()..sort();
     return list;
   }
 

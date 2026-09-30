@@ -18,10 +18,10 @@ class GraphView extends StatefulWidget {
   final WordGraph graph;
   final VoidCallback onGraphChanged;
 
-  /// Word to focus when the view first opens (e.g. from a sheet tag).
+  /// Word to select and scroll to when the view first opens.
   final String? initialWord;
 
-  /// Fires whenever the focused word changes (null when deleted).
+  /// Fires whenever the selected word changes (null when deleted).
   final ValueChanged<String?>? onSelectionChanged;
 
   const GraphView({
@@ -44,20 +44,31 @@ class _Placed {
 }
 
 class _Edge {
-  final Offset from; // bottom-center of parent bubble
-  final Offset to; // top-center of child bubble
-  final String parent;
-  final String child;
+  final Offset from; // anchor on bubble a's rim
+  final Offset to; // anchor on bubble b's rim
+  final String a;
+  final String b;
   final Offset mid; // curve midpoint, for the delete chip + hit-testing
-  _Edge(this.from, this.to, this.parent, this.child, this.mid);
+  _Edge(this.from, this.to, this.a, this.b, this.mid);
 }
 
 /// Shared curve math so layout, hit-testing and painting agree.
 ({Offset c1, Offset c2}) _edgeCurve(Offset from, Offset to) {
-  final dy = (to.dy - from.dy).clamp(24.0, 600.0);
+  final dx = to.dx - from.dx;
+  final dy = to.dy - from.dy;
+  if (dx.abs() >= dy.abs()) {
+    final spread = dx.abs().clamp(24.0, 600.0);
+    final dir = dx >= 0 ? 1.0 : -1.0;
+    return (
+      c1: Offset(from.dx + dir * spread * 0.55, from.dy),
+      c2: Offset(to.dx - dir * spread * 0.55, to.dy),
+    );
+  }
+  final spread = dy.abs().clamp(24.0, 600.0);
+  final dir = dy >= 0 ? 1.0 : -1.0;
   return (
-    c1: Offset(from.dx, from.dy + dy * 0.55),
-    c2: Offset(to.dx, to.dy - dy * 0.55),
+    c1: Offset(from.dx, from.dy + dir * spread * 0.55),
+    c2: Offset(to.dx, to.dy - dir * spread * 0.55),
   );
 }
 
@@ -89,13 +100,21 @@ Rect _nodeRect(Offset c) => Rect.fromCenter(
 
 class GraphViewState extends State<GraphView> {
   String? _selected;
-  final _childCtrl = TextEditingController();
-  final _parentCtrl = TextEditingController();
+  final _linkedCtrl = TextEditingController();
   final _jumpCtrl = TextEditingController();
+
+  /// Reused for every name dialog. Never disposed mid-flight: disposing a
+  /// dialog controller while its route animates out trips rebuilds that
+  /// still reference it (red screen). Disposed once with this state.
+  final TextEditingController _nameCtrl = TextEditingController();
   final TransformationController _pan = TransformationController();
 
-  /// User drag offsets per word, applied on top of the auto tree layout.
-  Map<String, Offset> _drag = {};
+  /// Words pinned to an exact canvas spot (double-click placement,
+  /// drag drops, tidy results). Null entry = auto-placed this layout.
+
+  /// Grab-point offset kept under the cursor while dragging, so the drop
+  /// lands exactly where the pointer is (canvas coords).
+  Offset _grabOffset = Offset.zero;
 
   /// Words pinned to an exact canvas spot (double-click placement).
   Map<String, Offset> _customPos = {};
@@ -106,12 +125,15 @@ class GraphViewState extends State<GraphView> {
   Offset? _linkFromPt; // canvas coords, temp line start
   Offset? _linkToPt; // canvas coords, temp line end
 
-  /// Word currently being dragged (canvas panning locks while set,
+  /// Word currently being dragged (canvas panning/zoom locks while set,
   /// so the bubble follows the cursor exactly).
   String? _draggingNode;
 
-  /// Selected arrow (parent -> child link), shown with a delete chip.
-  ({String parent, String child})? _selEdge;
+  /// Pointer currently driving a node drag (null = none).
+  int? _dragPointer;
+
+  /// Selected link (pair of words), shown with a delete chip.
+  ({String a, String b})? _selEdge;
   Offset? _tapDownPt; // canvas coords of the last press on empty canvas
 
   /// Coalesces rapid drag updates into one rebuild per frame.
@@ -139,9 +161,9 @@ class GraphViewState extends State<GraphView> {
 
   @override
   void dispose() {
-    _childCtrl.dispose();
-    _parentCtrl.dispose();
+    _linkedCtrl.dispose();
     _jumpCtrl.dispose();
+    _nameCtrl.dispose();
     _pan.dispose();
     super.dispose();
   }
@@ -158,7 +180,7 @@ class GraphViewState extends State<GraphView> {
     final init = widget.initialWord;
     if (init != null && widget.graph.get(init) != null) {
       _selected = WordGraph.norm(init);
-      _pendingCenter = _selected; // sheet opens scrolled to the word
+      _pendingCenter = _selected; // open scrolled to the word
     }
   }
 
@@ -168,10 +190,9 @@ class GraphViewState extends State<GraphView> {
   void _centerOnWord(String word, Size viewport) {
     final c = _lastPlaced[word];
     if (c == null) return;
-    const s = 1.0;
     _pan.value = Matrix4.translationValues(
-      viewport.width / 2 - c.dx * s,
-      viewport.height / 2 - c.dy * s,
+      viewport.width / 2 - c.dx,
+      viewport.height / 2 - c.dy,
       0.0,
     );
   }
@@ -191,7 +212,6 @@ class GraphViewState extends State<GraphView> {
   /// Pinned spots win; auto-placed newcomers get pinned where they landed.
   void _syncPositions() {
     _customPos.removeWhere((k, _) => !widget.graph.nodes.containsKey(k));
-    _drag.removeWhere((k, _) => !widget.graph.nodes.containsKey(k));
     for (final e in _customPos.entries) {
       final n = widget.graph.get(e.key);
       if (n != null) {
@@ -213,8 +233,7 @@ class GraphViewState extends State<GraphView> {
     setState(() {
       _selected = WordGraph.norm(word);
       _selEdge = null;
-      _childCtrl.clear();
-      _parentCtrl.clear();
+      _linkedCtrl.clear();
     });
     widget.onSelectionChanged?.call(_selected);
   }
@@ -224,7 +243,7 @@ class GraphViewState extends State<GraphView> {
     _tapDownPt = _toCanvas(global);
   }
 
-  /// Empty-canvas tap: select the nearest arrow, or clear the selection.
+  /// Empty-canvas tap: select the nearest link line, or clear the selection.
   void _canvasTap() {
     final pt = _tapDownPt;
     _tapDownPt = null;
@@ -243,25 +262,39 @@ class GraphViewState extends State<GraphView> {
       }
     }
     setState(() {
-      _selEdge =
-          best == null ? null : (parent: best.parent, child: best.child);
+      _selEdge = best == null ? null : (a: best.a, b: best.b);
     });
   }
 
   Future<void> _deleteSelectedEdge() async {
     final sel = _selEdge;
     if (sel == null) return;
-    widget.graph.unlinkParentChild(sel.parent, sel.child);
+    widget.graph.disconnect(sel.a, sel.b);
     setState(() => _selEdge = null);
     await _persist();
     _notice('Link removed.');
   }
 
-  /// Test hooks: canvas coords of an arrow's midpoint, and canvas->screen.
+  /// Test hook: create + place + select + persist, like the dialog flow.
   @visibleForTesting
-  Offset? debugEdgeMid(String parent, String child) {
+  Future<void> debugCreateWord(String name, Offset at) async {
+    widget.graph.ensure(name);
+    setState(() => _customPos[name] = at);
+    _select(name);
+    await _persist();
+  }
+
+  /// Test hooks: canvas coords of a link's midpoint, and canvas->screen.
+  @visibleForTesting
+  Offset? debugCenter(String word) => _lastPlaced[word];
+  @visibleForTesting
+  Offset? debugEdgeMid(String a, String b) {
+    final x = WordGraph.norm(a);
+    final y = WordGraph.norm(b);
     for (final e in _lastEdges) {
-      if (e.parent == parent && e.child == child) return e.mid;
+      if ((e.a == x && e.b == y) || (e.a == y && e.b == x)) {
+        return e.mid;
+      }
     }
     return null;
   }
@@ -274,26 +307,69 @@ class GraphViewState extends State<GraphView> {
     return box.localToGlobal(canvasPt);
   }
 
+  /// Tidy button: bloom the map radially around the selected word
+  /// (or the most-linked one) — center with rings around it, like a
+  /// classic mind map. Leftovers form their own ring to the side.
   void _resetView() {
-    // Tidy button: forget every saved spot and auto-arrange from scratch.
+    final g = widget.graph;
+    final keys = g.sortedKeys();
+    if (keys.isEmpty) return;
+    String center = _selected ?? '';
+    if (g.get(center) == null) {
+      center = keys.first;
+      var best = -1;
+      for (final k in keys) {
+        final n = g.neighborsOf(k).length;
+        if (n > best) {
+          best = n;
+          center = k;
+        }
+      }
+    }
     setState(() {
-      _drag = {};
       _customPos = {};
       _selEdge = null;
-    });
-    for (final n in widget.graph.nodes.values) {
-      n.x = null;
-      n.y = null;
-    }
-    _saveGraphNow();
-    // Land back on the focused word when there is one.
-    final sel = _selected;
-    if (sel != null && _lastPlaced.containsKey(sel)) {
-      _pendingCenter = sel;
-      setState(() {});
-    } else {
+      const cx = 1100.0;
+      const cy = 750.0;
+      final seen = <String>{center};
+      _customPos[center] = const Offset(cx, cy);
+      var ring = g.neighborsOf(center).where((w) => !seen.contains(w)).toList();
+      var radius = 360.0;
+      while (ring.isNotEmpty) {
+        for (var i = 0; i < ring.length; i++) {
+          final a = 2 * math.pi * i / ring.length - math.pi / 2;
+          _customPos[ring[i]] = Offset(
+            cx + math.cos(a) * radius,
+            cy + math.sin(a) * radius * 0.72,
+          );
+          seen.add(ring[i]);
+        }
+        final next = <String>[];
+        for (final w in ring) {
+          for (final nb in g.neighborsOf(w)) {
+            if (!seen.contains(nb) && !next.contains(nb)) next.add(nb);
+          }
+        }
+        ring = next;
+        radius += 320;
+      }
+      // Disconnected leftovers cascade to the right.
+      var lx = cx + radius + 260;
+      var ly = 300.0;
+      for (final k in keys) {
+        if (seen.contains(k)) continue;
+        _customPos[k] = Offset(lx, ly);
+        ly += 150;
+        if (ly > cy + radius) {
+          ly = 300;
+          lx += 260;
+        }
+      }
       _pan.value = Matrix4.identity();
-    }
+    });
+    _syncPositions();
+    _saveGraphNow();
+    _notice('Bloomed around "$center" — drag anything anywhere.');
   }
 
   void _notice(String msg) {
@@ -332,8 +408,11 @@ class GraphViewState extends State<GraphView> {
   }
 
   Future<String?> _askWordName(
-      {required String title, required String hint}) async {
-    final ctrl = TextEditingController();
+      {required String title,
+      required String hint,
+      String? initial,
+      String okLabel = 'Create'}) async {
+    _nameCtrl.text = initial ?? '';
     final field = OutlineInputBorder(
       borderRadius: BorderRadius.circular(12),
       borderSide: const BorderSide(color: PaperTheme.lineThin),
@@ -350,10 +429,10 @@ class GraphViewState extends State<GraphView> {
                 fontSize: 16,
                 fontWeight: FontWeight.w600)),
         content: TextField(
-          controller: ctrl,
+          controller: _nameCtrl,
           autofocus: true,
           onSubmitted: (_) => Navigator.of(ctx)
-              .pop(ctrl.text.trim().toLowerCase()),
+              .pop(_nameCtrl.text.trim().toLowerCase()),
           style:
               const TextStyle(color: PaperTheme.ink, fontSize: 14),
           decoration: InputDecoration(
@@ -375,16 +454,16 @@ class GraphViewState extends State<GraphView> {
           ),
           TextButton(
             onPressed: () => Navigator.of(ctx)
-                .pop(ctrl.text.trim().toLowerCase()),
-            child: const Text('Create',
-                style: TextStyle(
+                .pop(_nameCtrl.text.trim().toLowerCase()),
+            child: Text(okLabel,
+                style: const TextStyle(
                     color: PaperTheme.ink,
                     fontWeight: FontWeight.w700)),
           ),
         ],
       ),
     );
-    ctrl.dispose();
+    // NOTE: _nameCtrl is intentionally NOT disposed here (see field docs).
     if (name == null || name.trim().isEmpty) return null;
     return name.trim().toLowerCase();
   }
@@ -418,17 +497,17 @@ class GraphViewState extends State<GraphView> {
     await _persist();
   }
 
-  /// Double-click a bubble: quickly grow a child under it, fanned out
-  /// beside its siblings so nothing overlaps.
-  Future<void> _quickChild(String parent) async {
+  /// Double-click a bubble: quickly spin off a connected word nearby,
+  /// fanned out beside its existing links so nothing overlaps.
+  Future<void> _quickChild(String word) async {
     final name = await _askWordName(
-        title: 'Under "$parent"', hint: 'child of "$parent"…');
+        title: 'Connected to "$word"', hint: 'linked with "$word"…');
     if (name == null || !mounted) return;
     widget.graph.ensure(name);
-    widget.graph.linkParentChild(parent, name);
-    final sibs = widget.graph.childrenOf(parent);
+    widget.graph.connect(word, name);
+    final sibs = widget.graph.neighborsOf(word);
     final i = sibs.indexOf(name).clamp(0, 1 << 30);
-    final pc = _lastPlaced[parent] ?? const Offset(500, 300);
+    final pc = _lastPlaced[word] ?? const Offset(500, 300);
     setState(() {
       _customPos[name] = Offset(
         pc.dx + (i - (sibs.length - 1) / 2) * _slotGap,
@@ -463,50 +542,54 @@ class GraphViewState extends State<GraphView> {
     }
   }
 
-  void _nodePanDown(String word, Offset global) {
-    if (!_linkMode) {
-      // Lock canvas panning so the bubble tracks the cursor 1:1.
-      setState(() => _draggingNode = word);
-      return;
-    }
-    final c = _lastPlaced[word];
-    setState(() {
+  // ---- Canvas-wide pointer drag ----
+  // A front translucent Listener (see build) feeds every press/move here.
+  // Unlike gesture recognizers it never loses to the viewer's pan in the
+  // arena. Positions are absolute (pointer point + grab offset), so the
+  // grabbed spot stays glued under the cursor and the drop lands exactly
+  // where the pointer is — no drift math at all.
+  void _pointerDown(PointerDownEvent e) {
+    if (_dragPointer != null) _abandonDrag(); // heal any stuck drag
+    final at = _toCanvas(e.position);
+    final word = _bubbleAt(at);
+    if (word == null) return; // empty space: viewer pans normally
+    _dragPointer = e.pointer;
+    _grabOffset = (_lastPlaced[word] ?? at) - at;
+    // Lock the viewer before the first move event arrives.
+    setState(() => _draggingNode = word);
+    if (_linkMode) {
+      final c = _lastPlaced[word];
       _linkFrom = word;
       _linkFromPt = c;
       _linkToPt = c;
-    });
+    }
   }
 
-  void _nodePanUpdate(String word, Offset global, Offset delta) {
+  void _pointerMove(PointerMoveEvent e) {
+    if (e.pointer != _dragPointer || _draggingNode == null) return;
+    final word = _draggingNode!;
     if (_linkMode) {
-      _linkToPt = _toCanvas(global);
+      _linkToPt = _toCanvas(e.position);
       _coalesceRebuild();
       return;
     }
-    final s =
-        _pan.value.getMaxScaleOnAxis().clamp(0.3, 2.5);
-    if (_customPos.containsKey(word)) {
-      _customPos[word] = _customPos[word]! + delta / s;
-    } else {
-      _drag[word] = (_drag[word] ?? Offset.zero) + delta / s;
-    }
+    _customPos[word] = _toCanvas(e.position) + _grabOffset;
     _coalesceRebuild();
   }
 
-  void _nodePanEnd(String word) {
-    final wasDragging = _draggingNode != null;
-    if (wasDragging) {
-      setState(() => _draggingNode = null);
-    }
+  void _pointerUp(PointerEvent e) {
+    if (e.pointer != _dragPointer) return;
+    final word = _draggingNode;
+    _dragPointer = null;
     if (!_linkMode) {
-      // Pin the drop spot so the arrangement is kept exactly.
-      if (wasDragging) {
-        final c = _lastPlaced[word];
-        _drag.remove(word);
-        if (c != null) {
-          setState(() => _customPos[word] = c);
-          _persist();
-        }
+      // Pin the exact pointer spot so the drop is kept precisely.
+      if (word != null) {
+        final c = _toCanvas(e.position) + _grabOffset;
+        setState(() {
+          _draggingNode = null;
+          _customPos[word] = c;
+        });
+        _persist();
       }
       return;
     }
@@ -514,6 +597,7 @@ class GraphViewState extends State<GraphView> {
     final target =
         _linkToPt == null ? null : _bubbleAt(_linkToPt!);
     setState(() {
+      _draggingNode = null;
       _linkFrom = null;
       _linkFromPt = null;
       _linkToPt = null;
@@ -522,31 +606,31 @@ class GraphViewState extends State<GraphView> {
     _commitLink(from, target);
   }
 
-  /// Attach two words; the upper bubble becomes the parent.
+  /// Drop a stuck drag safely (e.g. pointer left the window mid-drag).
+  void _abandonDrag() {
+    final word = _draggingNode;
+    if (word != null && _lastPlaced.containsKey(word)) {
+      _customPos[word] = _lastPlaced[word]!;
+    }
+    _dragPointer = null;
+    _draggingNode = null;
+    _linkFrom = null;
+    _linkFromPt = null;
+    _linkToPt = null;
+  }
+
+  /// Draw a plain undirected link between two words.
   Future<void> _commitLink(String a, String b) async {
-    final ga = widget.graph.get(a);
-    final gb = widget.graph.get(b);
-    if (ga == null || gb == null) return;
-    if (ga.children.contains(b) || gb.children.contains(a)) {
+    if (widget.graph.get(a) == null || widget.graph.get(b) == null) {
+      return;
+    }
+    if (widget.graph.linked(a, b)) {
       _notice('Those two are already linked.');
       return;
     }
-    final pa = _lastPlaced[a] ?? Offset.zero;
-    final pb = _lastPlaced[b] ?? Offset.zero;
-    String parent, child;
-    if ((pa.dy - pb.dy).abs() < 12) {
-      parent = a;
-      child = b; // side by side: drawing direction wins
-    } else if (pa.dy < pb.dy) {
-      parent = a;
-      child = b;
-    } else {
-      parent = b;
-      child = a;
-    }
-    widget.graph.linkParentChild(parent, child);
+    widget.graph.connect(a, b);
     await _persist();
-    _notice('"$parent" is now above "$child".');
+    _notice('"$a" and "$b" are now linked.');
   }
 
   void _zoom(double factor) {
@@ -557,25 +641,23 @@ class GraphViewState extends State<GraphView> {
     _pan.value = m2;
   }
 
-  Future<void> _addChild() async {
+  Future<void> _addLinked() async {
     final sel = _selected;
-    final raw = _childCtrl.text.trim().toLowerCase();
+    final raw = _linkedCtrl.text.trim().toLowerCase();
     if (sel == null || raw.isEmpty) return;
     widget.graph.ensure(sel);
     widget.graph.ensure(raw);
-    widget.graph.linkParentChild(sel, raw);
-    _childCtrl.clear();
-    await _persist();
-  }
-
-  Future<void> _addParent() async {
-    final sel = _selected;
-    final raw = _parentCtrl.text.trim().toLowerCase();
-    if (sel == null || raw.isEmpty) return;
-    widget.graph.ensure(sel);
-    widget.graph.ensure(raw);
-    widget.graph.linkParentChild(raw, sel);
-    _parentCtrl.clear();
+    widget.graph.connect(sel, raw);
+    final sibs = widget.graph.neighborsOf(sel);
+    final i = sibs.indexOf(raw).clamp(0, 1 << 30);
+    final pc = _lastPlaced[sel] ?? const Offset(500, 300);
+    setState(() {
+      _customPos[raw] = Offset(
+        pc.dx + (i - (sibs.length - 1) / 2) * _slotGap,
+        pc.dy + _levelGap,
+      );
+    });
+    _linkedCtrl.clear();
     await _persist();
   }
 
@@ -597,69 +679,78 @@ class GraphViewState extends State<GraphView> {
     await _persist();
   }
 
-  Future<void> _unlink(String parent, String child) async {
-    widget.graph.unlinkParentChild(parent, child);
+  static const List<int> _palette = [
+    0xFFE4DCC7, // paper (default)
+    0xFFCBCFAE, // sage
+    0xFFD9C69E, // sand
+    0xFFD3B3A4, // clay
+    0xFFB9C2C6, // slate
+    0xFFD6BFC2, // blush
+  ];
+
+  Color _nodeColor(String word) {
+    final c = widget.graph.get(word)?.color;
+    if (c == null) return const Color(0xFFE4DCC7);
+    return Color(c);
+  }
+
+  Future<void> _renameSelected() async {
+    final sel = _selected;
+    if (sel == null) return;
+    final name = await _askWordName(
+        title: 'Rename "$sel"',
+        hint: 'new name…',
+        initial: sel,
+        okLabel: 'Rename');
+    if (name == null || !mounted) return;
+    if (!widget.graph.rename(sel, name)) {
+      _notice('Could not rename — name taken or invalid.');
+      return;
+    }
+    setState(() {
+      final spot = _customPos.remove(sel);
+      if (spot != null) _customPos[name] = spot;
+      _selected = name;
+    });
     await _persist();
   }
 
-  // ---- Full-forest tidy tree layout ----
+  void _setColor(int? color) {
+    final sel = _selected;
+    if (sel == null) return;
+    widget.graph.get(sel)?.color = color;
+    setState(() {});
+    _persist();
+  }
+
+  // ---- Free-canvas layout ----
+  // Saved spots win. Words never placed before cascade out from the
+  // middle in reading order; the pass below keeps them from overlapping.
+  // Nothing here ever moves a pinned word.
   ({List<_Placed> placed, List<_Edge> edges, Size canvas}) _layoutAll() {
     final g = widget.graph;
     final pos = <String, Offset>{};
-    final visited = <String>{};
-    int slot = 0;
-    int maxDepth = 0;
-
-    List<String> kidsOf(String w) {
-      final n = g.get(w);
-      if (n == null) return const [];
-      final list = n.children.toList()..sort();
-      return list;
-    }
-
-    void place(String w, int depth) {
-      if (visited.contains(w)) return;
-      visited.add(w);
-      maxDepth = math.max(maxDepth, depth);
-      final kids = kidsOf(w);
-      if (kids.isEmpty) {
-        pos[w] = Offset(
-            _margin + slot * _slotGap, _margin + depth * _levelGap);
-        slot++;
-      } else {
-        for (final k in kids) {
-          place(k, depth + 1);
-        }
-        final xs = [
-          for (final k in kids)
-            if (pos.containsKey(k)) pos[k]!.dx
-        ];
-        final cx = xs.isEmpty
-            ? _margin + slot * _slotGap
-            : (xs.reduce((a, b) => a + b) / xs.length);
-        pos[w] = Offset(cx, _margin + depth * _levelGap);
-      }
-    }
-
-    // Roots first (no parents on top), then anything left over (cycles).
-    final roots = [
-      for (final k in g.sortedKeys())
-        if ((g.get(k)?.parents.isEmpty ?? true)) k
-    ];
-    for (final r in roots) {
-      place(r, 0);
-    }
+    var i = 0;
     for (final k in g.sortedKeys()) {
-      if (!visited.contains(k)) place(k, 0);
+      if (_customPos.containsKey(k)) continue;
+      pos[k] = Offset(
+        320 + (i % 5) * 230,
+        260 + (i ~/ 5) * 160,
+      );
+      i++;
     }
 
     // Pinned words stay where the user put them; others follow the auto
-    // layout plus small drag nudges.
+    // layout.
     final placed = <_Placed>[];
     pos.forEach((w, p) {
-      placed.add(
-          _Placed(w, _customPos[w] ?? (p + (_drag[w] ?? Offset.zero))));
+      placed.add(_Placed(w, _customPos[w] ?? p));
     });
+    for (final e in _customPos.entries) {
+      if (g.nodes.containsKey(e.key) && !pos.containsKey(e.key)) {
+        placed.add(_Placed(e.key, e.value));
+      }
+    }
 
     // De-collide: no two bubbles may sit on top of each other. Pinned
     // words keep their exact spot; the rest slide straight down until
@@ -687,20 +778,37 @@ class GraphViewState extends State<GraphView> {
 
     final byWord = {for (final p in placed) p.word: p.center};
 
-    // One bendy arrow per parent -> child link, pointing down at the child.
+    // One plain link line per connection (undirected, each pair once).
     final edges = <_Edge>[];
     for (final n in g.nodes.values) {
-      final pkey = WordGraph.norm(n.name);
-      final from = byWord[pkey];
+      final akey = WordGraph.norm(n.name);
+      final from = byWord[akey];
       if (from == null) continue;
-      for (final c in n.children) {
+      for (final c in n.links) {
+        if (akey.compareTo(c) >= 0) continue; // draw each pair once
         final to = byWord[c];
         if (to == null) continue;
-        final f = Offset(from.dx, from.dy + _nodeH / 2);
-        final t = Offset(to.dx, to.dy - _nodeH / 2);
+        // Anchor on facing sides so lines leave bubbles cleanly.
+        final bool sideBySide =
+            (to.dx - from.dx).abs() >= (to.dy - from.dy).abs();
+        final Offset f;
+        final Offset t;
+        if (sideBySide && to.dx >= from.dx) {
+          f = Offset(from.dx + _nodeW / 2, from.dy);
+          t = Offset(to.dx - _nodeW / 2, to.dy);
+        } else if (sideBySide) {
+          f = Offset(from.dx - _nodeW / 2, from.dy);
+          t = Offset(to.dx + _nodeW / 2, to.dy);
+        } else if (to.dy >= from.dy) {
+          f = Offset(from.dx, from.dy + _nodeH / 2);
+          t = Offset(to.dx, to.dy - _nodeH / 2);
+        } else {
+          f = Offset(from.dx, from.dy - _nodeH / 2);
+          t = Offset(to.dx, to.dy + _nodeH / 2);
+        }
         final curve = _edgeCurve(f, t);
         edges.add(_Edge(
-            f, t, pkey, c, _cubicAt(f, curve.c1, curve.c2, t, 0.5)));
+            f, t, akey, c, _cubicAt(f, curve.c1, curve.c2, t, 0.5)));
       }
     }
 
@@ -710,13 +818,8 @@ class GraphViewState extends State<GraphView> {
       if (p.center.dx > maxRight) maxRight = p.center.dx;
       if (p.center.dy > maxBottom) maxBottom = p.center.dy;
     }
-    final w = math.max(
-        2200.0,
-        math.max(_margin * 2 + slot * _slotGap, maxRight + _margin));
-    final h = math.max(
-        1500.0,
-        math.max(_margin * 2 + (maxDepth + 1) * _levelGap,
-            maxBottom + _margin));
+    final w = math.max(2200.0, maxRight + _margin);
+    final h = math.max(1500.0, maxBottom + _margin);
     return (placed: placed, edges: edges, canvas: Size(w, h));
   }
 
@@ -827,7 +930,7 @@ class GraphViewState extends State<GraphView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                // Gentle inspector for the focused word.
+                // Inspector for the selected word.
                 if (sel != null)
                   Container(
                     padding: const EdgeInsets.symmetric(
@@ -847,7 +950,7 @@ class GraphViewState extends State<GraphView> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 14, vertical: 7),
                           decoration: BoxDecoration(
-                            color: PaperTheme.card,
+                            color: _nodeColor(sel.name),
                             border:
                                 Border.all(color: PaperTheme.line),
                             borderRadius: BorderRadius.circular(16),
@@ -858,20 +961,46 @@ class GraphViewState extends State<GraphView> {
                                   fontSize: 15,
                                   fontWeight: FontWeight.w700)),
                         ),
-                        SizedBox(
-                          width: 170,
-                          child: _MiniField(
-                            controller: _childCtrl,
-                            hint: '+ child (goes below)…',
-                            onAdd: _addChild,
-                          ),
+                        IconButton(
+                          tooltip: 'Rename',
+                          onPressed: _renameSelected,
+                          icon: const Icon(Icons.edit_outlined,
+                              size: 17,
+                              color: PaperTheme.inkSoft),
                         ),
+                        // Card color dots.
+                        for (final c in _palette)
+                          InkWell(
+                            onTap: () => _setColor(
+                                c == _palette.first ? null : c),
+                            borderRadius: BorderRadius.circular(10),
+                            child: Container(
+                              width: 20,
+                              height: 20,
+                              decoration: BoxDecoration(
+                                color: Color(c),
+                                shape: BoxShape.circle,
+                                border: Border.all(
+                                  color: sel.color == c ||
+                                          (sel.color == null &&
+                                              c == _palette.first)
+                                      ? PaperTheme.ink
+                                      : PaperTheme.lineThin,
+                                  width: sel.color == c ||
+                                          (sel.color == null &&
+                                              c == _palette.first)
+                                      ? 2
+                                      : 1,
+                                ),
+                              ),
+                            ),
+                          ),
                         SizedBox(
-                          width: 170,
+                          width: 190,
                           child: _MiniField(
-                            controller: _parentCtrl,
-                            hint: '+ parent (goes above)…',
-                            onAdd: _addParent,
+                            controller: _linkedCtrl,
+                            hint: '+ linked word…',
+                            onAdd: _addLinked,
                           ),
                         ),
                         IconButton(
@@ -919,6 +1048,7 @@ class GraphViewState extends State<GraphView> {
                             InteractiveViewer(
                               transformationController: _pan,
                               panEnabled: _draggingNode == null,
+                              scaleEnabled: _draggingNode == null,
                               constrained: false,
                               boundaryMargin:
                                   const EdgeInsets.all(double.infinity),
@@ -963,19 +1093,17 @@ class GraphViewState extends State<GraphView> {
                                             laid.edges,
                                             tempFrom: _linkFromPt,
                                             tempTo: _linkToPt,
-                                            selParent:
-                                                _selEdge?.parent,
-                                            selChild:
-                                                _selEdge?.child),
+                                            selA: _selEdge?.a,
+                                            selB: _selEdge?.b),
                                       ),
                                     ),
-                                    // Delete chip on the selected arrow.
+                                    // Delete chip on the selected link.
                                     if (_selEdge != null)
                                       for (final e in laid.edges)
-                                        if (e.parent ==
-                                                _selEdge!.parent &&
-                                            e.child ==
-                                                _selEdge!.child)
+                                        if ((e.a == _selEdge!.a &&
+                                                e.b == _selEdge!.b) ||
+                                            (e.a == _selEdge!.b &&
+                                                e.b == _selEdge!.a))
                                           Positioned(
                                             left: (e.mid.dx - 78)
                                                 .clamp(
@@ -1061,57 +1189,40 @@ class GraphViewState extends State<GraphView> {
                                         top: p.center.dy -
                                             _nodeH / 2,
                                         child: GestureDetector(
+                                          // Taps select / drill; all dragging
+                                          // is driven by the canvas pointer
+                                          // layer so bubbles never lose a drag.
                                           onTap: () => _linkMode
                                               ? _linkTap(p.word)
                                               : _select(p.word),
                                           onDoubleTap: () =>
                                               _quickChild(p.word),
-                                          onPanDown: (d) =>
-                                              _nodePanDown(p.word,
-                                                  d.globalPosition),
-                                          onPanUpdate: (d) =>
-                                              _nodePanUpdate(
-                                                  p.word,
-                                                  d.globalPosition,
-                                                  d.delta),
-                                          onPanEnd: (_) =>
-                                              _nodePanEnd(p.word),
-                                          onPanCancel: () =>
-                                              _nodePanEnd(p.word),
                                           child: _MapNode(
                                             word: p.word,
+                                            fill: _nodeColor(p.word),
                                             isCenter:
                                                 p.word == _selected,
                                             linkSource:
                                                 _linkMode &&
                                                     _linkFrom ==
                                                         p.word,
-                                            onUnlink: p.word ==
-                                                    _selected
-                                                ? null
-                                                : () {
-                                                    final n = widget
-                                                        .graph
-                                                        .get(sel?.name ??
-                                                            '');
-                                                    if (n == null) {
-                                                      return;
-                                                    }
-                                                    if (n.parents.contains(
-                                                        p.word)) {
-                                                      _unlink(p.word,
-                                                          n.name);
-                                                    } else if (n
-                                                        .children
-                                                        .contains(
-                                                            p.word)) {
-                                                      _unlink(n.name,
-                                                          p.word);
-                                                    }
-                                                  },
                                           ),
                                         ),
                                       ),
+                                    // Front drag layer: feeds every press and
+                                    // move straight to the drag logic, immune
+                                    // to gesture-arena fights, while letting
+                                    // taps fall through to bubbles beneath.
+                                    Positioned.fill(
+                                      child: Listener(
+                                        behavior:
+                                            HitTestBehavior.translucent,
+                                        onPointerDown: _pointerDown,
+                                        onPointerMove: _pointerMove,
+                                        onPointerUp: _pointerUp,
+                                        onPointerCancel: _pointerUp,
+                                      ),
+                                    ),
                                   ],
                                 ),
                               ),
@@ -1136,7 +1247,7 @@ class GraphViewState extends State<GraphView> {
                                           BorderRadius.circular(16),
                                     ),
                                     child: const Text(
-                                      'Link mode: drag from one bubble to another · the upper one becomes the parent',
+                                      'Link mode: drag from one bubble to another to link them',
                                       style: TextStyle(
                                           color: PaperTheme.ink,
                                           fontSize: 11),
@@ -1183,7 +1294,7 @@ class GraphViewState extends State<GraphView> {
                                               PaperTheme.inkSoft),
                                     ),
                                     IconButton(
-                                      tooltip: 'Tidy up + recenter',
+                                      tooltip: 'Bloom: radial mind-map tidy',
                                       onPressed: _resetView,
                                       icon: const Icon(
                                           Icons.center_focus_weak,
@@ -1208,7 +1319,7 @@ class GraphViewState extends State<GraphView> {
                               left: 12,
                               bottom: 14,
                               child: Text(
-                                'your arrangement auto-saves · click a line to cut it · double-click space: new word · link tool: drag bubble to bubble',
+                                'drag bubbles to arrange (they stay) · click a line to cut it · double-click space: new word · bloom button: radial tidy',
                                 style: TextStyle(
                                     color: PaperTheme.inkSoft,
                                     fontSize: 10),
@@ -1264,14 +1375,14 @@ class _MiniField extends StatelessWidget {
 /// Soft rounded mind-map bubble.
 class _MapNode extends StatelessWidget {
   final String word;
+  final Color fill;
   final bool isCenter;
   final bool linkSource;
-  final VoidCallback? onUnlink;
   const _MapNode(
       {required this.word,
+      required this.fill,
       required this.isCenter,
-      this.linkSource = false,
-      this.onUnlink});
+      this.linkSource = false});
 
   @override
   Widget build(BuildContext context) {
@@ -1279,11 +1390,7 @@ class _MapNode extends StatelessWidget {
       width: GraphViewState._nodeW,
       height: GraphViewState._nodeH,
       decoration: BoxDecoration(
-        color: linkSource
-            ? const Color(0xFFCFC5AB)
-            : isCenter
-                ? PaperTheme.card
-                : const Color(0xFFE4DCC7),
+        color: linkSource ? const Color(0xFFCFC5AB) : fill,
         border: Border.all(
             color: (isCenter || linkSource)
                 ? PaperTheme.inkSoft
@@ -1298,40 +1405,25 @@ class _MapNode extends StatelessWidget {
           ),
         ],
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Flexible(
-            child: Padding(
-              padding: EdgeInsets.only(left: onUnlink == null ? 0 : 8),
-              child: Text(
-                word,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  color: PaperTheme.ink,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w500,
-                ),
-              ),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          child: Text(
+            word,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: PaperTheme.ink,
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
             ),
           ),
-          if (onUnlink != null)
-            InkWell(
-              onTap: onUnlink,
-              child: const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 6),
-                child:
-                    Icon(Icons.close, size: 13, color: PaperTheme.inkSoft),
-              ),
-            ),
-        ],
+        ),
       ),
     );
   }
 }
 
-/// Soft bendy arrows between bubbles, muted like the rest.
+/// Soft bendy link lines between bubbles, muted like the rest.
 class _BranchPainter extends CustomPainter {
   final List<_Edge> edges;
 
@@ -1339,59 +1431,36 @@ class _BranchPainter extends CustomPainter {
   final Offset? tempFrom;
   final Offset? tempTo;
 
-  /// Highlighted (selected) arrow.
-  final String? selParent;
-  final String? selChild;
+  /// Highlighted (selected) link.
+  final String? selA;
+  final String? selB;
 
   _BranchPainter(this.edges,
-      {this.tempFrom, this.tempTo, this.selParent, this.selChild});
+      {this.tempFrom, this.tempTo, this.selA, this.selB});
 
   @override
   void paint(Canvas canvas, Size size) {
     final line = Paint()
       ..color = PaperTheme.line
       ..style = PaintingStyle.stroke
-      ..strokeWidth = 1.2
-      ..strokeCap = StrokeCap.round;
-    final head = Paint()
-      ..color = PaperTheme.inkSoft
-      ..style = PaintingStyle.stroke
       ..strokeWidth = 1.4
       ..strokeCap = StrokeCap.round;
     for (final e in edges) {
-      final selected =
-          e.parent == selParent && e.child == selChild;
+      final selected = (e.a == selA && e.b == selB) ||
+          (e.a == selB && e.b == selA);
       final paint = selected
           ? (Paint()
             ..color = PaperTheme.ink
             ..style = PaintingStyle.stroke
-            ..strokeWidth = 2.0
+            ..strokeWidth = 2.2
             ..strokeCap = StrokeCap.round)
           : line;
-      final dy = (e.to.dy - e.from.dy).clamp(24.0, 600.0);
-      final c1 = Offset(e.from.dx, e.from.dy + dy * 0.55);
-      final c2 = Offset(e.to.dx, e.to.dy - dy * 0.55);
+      final c = _edgeCurve(e.from, e.to);
       final path = Path()
         ..moveTo(e.from.dx, e.from.dy)
-        ..cubicTo(c1.dx, c1.dy, c2.dx, c2.dy, e.to.dx, e.to.dy);
+        ..cubicTo(
+            c.c1.dx, c.c1.dy, c.c2.dx, c.c2.dy, e.to.dx, e.to.dy);
       canvas.drawPath(path, paint);
-      // Little arrowhead pointing along the curve into the child.
-      final tangent =
-          math.atan2(e.to.dy - c2.dy, e.to.dx - c2.dx);
-      const len = 7.0;
-      const spread = 0.5;
-      canvas.drawLine(
-          e.to,
-          e.to -
-              Offset(math.cos(tangent - spread) * len,
-                  math.sin(tangent - spread) * len),
-          head);
-      canvas.drawLine(
-          e.to,
-          e.to -
-              Offset(math.cos(tangent + spread) * len,
-                  math.sin(tangent + spread) * len),
-          head);
     }
     // The line being drawn right now.
     final tf = tempFrom;
@@ -1415,8 +1484,8 @@ class _BranchPainter extends CustomPainter {
       old.edges != edges ||
       old.tempFrom != tempFrom ||
       old.tempTo != tempTo ||
-      old.selParent != selParent ||
-      old.selChild != selChild;
+      old.selA != selA ||
+      old.selB != selB;
 }
 
 /// Faint dot grid so the canvas feels like a mind-map board.

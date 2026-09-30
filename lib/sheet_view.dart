@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_quill/flutter_quill.dart'
     show
         Document,
@@ -23,8 +24,8 @@ import 'theme.dart';
 
 /// Writing view: titled sessions in a left rail, a styled editor
 /// (bold / italic / underline / text color / highlight / headers / lists)
-/// and the @ / # tag flow — finishing a known word slides the mind-map
-/// up as a bottom sheet focused on that word.
+/// and @ mentions — typing @ pops up the words from the mind-map,
+/// tapping one inserts it into the text.
 class SheetView extends StatefulWidget {
   final StorageService storage;
   final WordGraph graph;
@@ -54,10 +55,14 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   bool _switching = false; // guards programmatic controller updates
   bool _onImage = false; // caret sits on an image embed
 
-  // Bottom-sheet session for the current tag.
-  bool _sheetOpen = false;
-  ValueNotifier<String>? _focusNote;
-  String? _autoKey; // last "mode:word" opened or dismissed
+  // Mention popup state (@frag -> matching words).
+  final LayerLink _layerLink = LayerLink();
+  final GlobalKey _editorKey = GlobalKey();
+  OverlayEntry? _overlay;
+  List<String> _matches = [];
+  String _frag = '';
+  Offset _popupOffset = const Offset(0, 40);
+  double _editorWidth = 600;
 
   @override
   void initState() {
@@ -224,7 +229,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   void dispose() {
     _saveNow();
     _saver.dispose();
-    _focusNote?.dispose();
+    _removeOverlay();
     WidgetsBinding.instance.removeObserver(this);
     _quill.removeListener(_onDocChanged);
     _quill.dispose();
@@ -243,8 +248,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     }
   }
 
-  // ---- Tag detection (@word / #word before the cursor) ----
-  ({String mode, String word})? _detectTrigger() {
+  // ---- Mention picker (@frag before the cursor) ----
+  // Returns the fragment (possibly empty) or null when no @ tag applies.
+  String? _detectMention() {
     final text = _quill.document.toPlainText();
     final sel = _quill.selection;
     if (!sel.isValid || sel.baseOffset < 0) return null;
@@ -253,12 +259,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     while (i >= 0 && _isWordChar(text[i])) {
       i--;
     }
-    if (i < 0) return null;
-    final sigil = text[i];
-    if (sigil != '@' && sigil != '#') return null;
+    if (i < 0 || text[i] != '@') return null;
     if (i > 0 && !_isBoundary(text[i - 1])) return null;
-    final word = text.substring(i + 1, cursor).toLowerCase();
-    return (mode: sigil, word: word);
+    return text.substring(i + 1, cursor).toLowerCase();
   }
 
   bool _isWordChar(String ch) => RegExp(r'[\w]').hasMatch(ch);
@@ -267,38 +270,215 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
 
   void _updateLookup() {
     if (!_loaded || _activeId == null) return;
-    // Never hijack an active text selection with the map sheet.
-    if (_quill.selection.start != _quill.selection.end) return;
-    if (_sheetOpen) {
-      _refocusFromTag();
+    // Never hijack an active text selection with the popup.
+    if (_quill.selection.start != _quill.selection.end) {
+      _removeOverlay();
       return;
     }
-    final trig = _detectTrigger();
-    if (trig == null) {
-      _autoKey = null;
+    final frag = _detectMention();
+    if (frag == null) {
+      _removeOverlay();
       return;
     }
-    if (trig.word.length < 2) return; // let the word be finished first
-    if (widget.graph.get(trig.word) == null) return; // still partial
-    final key = '${trig.mode}:${trig.word}';
-    if (key == _autoKey) return; // already shown / dismissed for this tag
-    _autoKey = key;
-    _openTagSheet(trig.mode, trig.word);
+    final all = widget.graph.sortedKeys();
+    final starts = [
+      for (final k in all)
+        if (k.startsWith(frag)) k
+    ];
+    final contains = [
+      for (final k in all)
+        if (!k.startsWith(frag) && k.contains(frag)) k
+    ];
+    _frag = frag;
+    _matches = [...starts, ...contains];
+    if (_matches.isEmpty) {
+      _removeOverlay();
+      return;
+    }
+    _estimateCaretOffset();
+    if (_overlay == null) {
+      _showOverlay();
+    } else {
+      _overlay!.markNeedsBuild();
+    }
   }
 
-  /// While the sheet stays open, follow the tag if it becomes another word.
-  void _refocusFromTag() {
-    final trig = _detectTrigger();
-    if (trig == null || trig.word.length < 2) return;
-    if (widget.graph.get(trig.word) == null) return;
-    final key = '${trig.mode}:${trig.word}';
-    _autoKey = key;
-    if (_focusNote?.value != trig.word) _focusNote?.value = trig.word;
+  // Rough caret position so the popup floats near the cursor.
+  void _estimateCaretOffset() {
+    try {
+      final box =
+          _editorKey.currentContext?.findRenderObject() as RenderBox?;
+      if (box != null && box.hasSize) _editorWidth = box.size.width;
+      const lineHeight = 27.0;
+      const charWidth = 8.0;
+      final text = _quill.document.toPlainText();
+      final cursor =
+          _quill.selection.baseOffset.clamp(0, text.length);
+      final before = text.substring(0, cursor);
+      final lines = before.split('\n');
+      final line = lines.length - 1;
+      final col = lines.isEmpty ? 0 : lines.last.length;
+      final x = (10 + col * charWidth)
+          .clamp(10, (_editorWidth - 220).clamp(10, 1e6))
+          .toDouble();
+      _popupOffset = Offset(x, 8 + (line + 1) * lineHeight);
+    } catch (_) {
+      _popupOffset = const Offset(10, 40);
+    }
   }
 
-  void _openTagSheet(String mode, String word) {
-    _sheetOpen = true;
-    _focusNote = ValueNotifier(word);
+  void _showOverlay() {
+    _removeOverlay();
+    final overlay = Overlay.of(context);
+    _overlay = OverlayEntry(
+      builder: (_) => Stack(
+        children: [
+          // Taps anywhere else dismiss; taps on the popup reach it first.
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: _removeOverlay,
+            ),
+          ),
+          CompositedTransformFollower(
+            link: _layerLink,
+            showWhenUnlinked: false,
+            offset: _popupOffset,
+            child: Align(
+              alignment: Alignment.topLeft,
+              child: _buildPicker(),
+            ),
+          ),
+        ],
+      ),
+    );
+    overlay.insert(_overlay!);
+  }
+
+  void _removeOverlay() {
+    _overlay?.remove();
+    _overlay = null;
+  }
+
+  /// Tiny floating mention list — fixed small size, never a big panel.
+  Widget _buildPicker() {
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        width: 210,
+        decoration: BoxDecoration(
+          color: const Color(0xFFF4EEDF),
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF3E3A31).withValues(alpha: 0.14),
+              blurRadius: 14,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 6, 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      _frag.isEmpty ? 'words…' : 'matching "$_frag"…',
+                      style: const TextStyle(
+                        color: PaperTheme.inkSoft,
+                        fontSize: 11,
+                        fontStyle: FontStyle.italic,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  InkWell(
+                    onTap: _removeOverlay,
+                    borderRadius: BorderRadius.circular(12),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(Icons.close,
+                          size: 13, color: PaperTheme.inkSoft),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 168),
+              child: ListView.builder(
+                shrinkWrap: true,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 5, vertical: 2),
+                itemCount: _matches.length,
+                itemBuilder: (context, i) {
+                  final w = _matches[i];
+                  return GestureDetector(
+                    // Tap inserts the word; long-press copies it.
+                    onTap: () => _insertWord(w),
+                    onLongPress: () => _copyWord(w),
+                    child: Container(
+                      margin:
+                          const EdgeInsets.symmetric(vertical: 1),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 9, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.transparent,
+                        borderRadius: BorderRadius.circular(9),
+                      ),
+                      child: Text(
+                        w,
+                        style: const TextStyle(
+                          color: PaperTheme.ink,
+                          fontSize: 12.5,
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(12, 3, 12, 8),
+              child: Text(
+                'tap to insert · long-press to copy',
+                style: TextStyle(
+                    color: PaperTheme.inkSoft, fontSize: 9),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Replace "@frag" at the cursor with the picked word plus a space,
+  /// then slide the map up already scrolled to that word.
+  void _insertWord(String word) {
+    final text = _quill.document.toPlainText();
+    final cursor =
+        _quill.selection.baseOffset.clamp(0, text.length);
+    int i = cursor - 1;
+    while (i >= 0 && _isWordChar(text[i])) {
+      i--;
+    }
+    if (i < 0 || text[i] != '@') {
+      _removeOverlay();
+      return;
+    }
+    _quill.replaceText(i, cursor - i, '$word ',
+        TextSelection.collapsed(offset: i + word.length + 1));
+    _removeOverlay();
+    _focusNode.requestFocus();
+    _openMapSheet(word);
+  }
+
+  void _openMapSheet(String word) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -312,23 +492,36 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
           child: TagGraphSheet(
             storage: widget.storage,
             graph: widget.graph,
-            mode: mode,
-            focus: _focusNote!,
+            word: word,
             onGraphChanged: widget.onGraphChanged,
           ),
         ),
       ),
     ).then((_) {
-      _sheetOpen = false;
-      _focusNote?.dispose();
-      _focusNote = null;
       if (mounted) _focusNode.requestFocus();
     });
   }
 
-  /// Called by the shell when the graph changes; the open sheet reads the
-  /// same live graph object, so there is nothing to refresh here.
-  void refreshGraph() {}
+  void _copyWord(String word) {
+    Clipboard.setData(ClipboardData(text: word));
+    if (mounted) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Copied "$word" — ready to paste.'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    }
+  }
+
+  // Bottom-sheet tag flow removed; @mentions insert the word directly.
+
+  /// Called by the shell when the graph changes; the popup reads the live
+  /// graph object, so a refresh is just a re-lookup.
+  void refreshGraph() {
+    if (_overlay != null) _updateLookup();
+  }
 
   /// Test hook: types text at the end of the note as if the user typed it.
   @visibleForTesting
@@ -338,20 +531,16 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         TextSelection.collapsed(offset: at + text.length));
   }
 
-  void _onSigilButton(String sigil) {
-    final trig = _detectTrigger();
-    if (trig != null &&
-        trig.word.length >= 2 &&
-        widget.graph.get(trig.word) != null) {
-      _autoKey = null; // deliberate re-open, even for the same tag
-      _updateLookup();
-      return;
-    }
-    // Insert the sigil at the cursor.
+  /// Test hook: current plain text of the note.
+  @visibleForTesting
+  String debugPlainText() => _quill.document.toPlainText();
+
+  /// Insert "@" at the cursor (toolbar button).
+  void _onAtButton() {
     final pos = _quill.selection.baseOffset;
     final len = _quill.document.length;
     final at = pos < 0 ? len - 1 : pos.clamp(0, len - 1);
-    _quill.replaceText(at, 0, sigil, null);
+    _quill.replaceText(at, 0, '@', null);
     _focusNode.requestFocus();
   }
 
@@ -538,15 +727,12 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                               ),
                               Row(
                                 children: [
-                                  _sigilButton('@', 'children',
-                                      () => _onSigilButton('@')),
-                                  const SizedBox(width: 8),
-                                  _sigilButton('#', 'parents',
-                                      () => _onSigilButton('#')),
+                                  _sigilButton('@', 'mention',
+                                      _onAtButton),
                                   const SizedBox(width: 8),
                                   const Expanded(
                                     child: Text(
-                                      'finish the word — its map slides up',
+                                      'type @ to mention a word from the map',
                                       textAlign: TextAlign.right,
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
@@ -628,24 +814,30 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                   ),
                                 ),
                               Expanded(
-                                child: QuillEditor.basic(
-                                  controller: _quill,
-                                  focusNode: _focusNode,
-                                  scrollController: _scrollCtrl,
-                                  config: QuillEditorConfig(
-                                    embedBuilders: kIsWeb
-                                        ? FlutterQuillEmbeds
-                                            .editorWebBuilders()
-                                        : FlutterQuillEmbeds
-                                            .editorBuilders(),
-                                    // Keep single-line: quill embeds the
-                                    // placeholder raw in JSON (newlines crash it).
-                                    placeholder:
-                                        'Write freely… type @eat to open its map.',
-                                    autoFocus: true,
-                                    scrollable: true,
-                                    padding: EdgeInsets.symmetric(
-                                        vertical: 8),
+                                child: CompositedTransformTarget(
+                                  link: _layerLink,
+                                  child: Container(
+                                    key: _editorKey,
+                                    child: QuillEditor.basic(
+                                      controller: _quill,
+                                      focusNode: _focusNode,
+                                      scrollController: _scrollCtrl,
+                                      config: QuillEditorConfig(
+                                        embedBuilders: kIsWeb
+                                            ? FlutterQuillEmbeds
+                                                .editorWebBuilders()
+                                            : FlutterQuillEmbeds
+                                                .editorBuilders(),
+                                        // Keep single-line: quill embeds the
+                                        // placeholder raw in JSON (newlines crash it).
+                                        placeholder:
+                                            'Write freely… type @ to mention a word.',
+                                        autoFocus: true,
+                                        scrollable: true,
+                                        padding: EdgeInsets.symmetric(
+                                            vertical: 8),
+                                      ),
+                                    ),
                                   ),
                                 ),
                               ),

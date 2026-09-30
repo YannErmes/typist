@@ -226,11 +226,7 @@ class StorageService {
       }
       // Scrub dangling refs so UI never shows ghosts.
       for (final n in graph.nodes.values) {
-        n.parents = n.parents
-            .map(WordGraph.norm)
-            .where((e) => e.isNotEmpty && graph.nodes.containsKey(e))
-            .toSet();
-        n.children = n.children
+        n.links = n.links
             .map(WordGraph.norm)
             .where((e) => e.isNotEmpty && graph.nodes.containsKey(e))
             .toSet();
@@ -269,51 +265,56 @@ class StorageService {
 
   static String serializeWordFile(WordNode node) {
     final name = node.name.trim().toLowerCase();
-    final parents = node.parents.map((e) => e.trim().toLowerCase())
-        .where((e) => e.isNotEmpty)
-        .toList()
-      ..sort();
-    final children = node.children.map((e) => e.trim().toLowerCase())
+    final links = node.links.map((e) => e.trim().toLowerCase())
         .where((e) => e.isNotEmpty)
         .toList()
       ..sort();
     final buf = StringBuffer()
       ..writeln('# $name')
-      ..writeln('parents: ${parents.join(', ')}')
-      ..writeln('children: ${children.join(', ')}');
+      ..writeln('links: ${links.join(', ')}');
     if (node.hasPos) {
       buf
         ..writeln('x: ${node.x!.toStringAsFixed(1)}')
         ..writeln('y: ${node.y!.toStringAsFixed(1)}');
+    }
+    if (node.color != null) {
+      buf.writeln('color: ${node.color}');
     }
     return buf.toString();
   }
 
   static WordNode? parseWordFile(String content) {
     String? title;
-    Set<String> parents = {};
-    Set<String> children = {};
+    Set<String> links = {};
     double? x;
     double? y;
+    int? color;
     for (final rawLine in content.split('\n')) {
       final line = rawLine.trim();
       if (line.startsWith('#')) {
         title = line.replaceFirst(RegExp(r'^#+\s*'), '').trim().toLowerCase();
-      } else if (line.toLowerCase().startsWith('parents:')) {
-        parents = _parseList(line.substring('parents:'.length));
-      } else if (line.toLowerCase().startsWith('children:')) {
-        children = _parseList(line.substring('children:'.length));
+      } else if (line.toLowerCase().startsWith('links:')) {
+        links = _parseList(line.substring('links:'.length));
+      } else if (line.toLowerCase().startsWith('parents:') ||
+          line.toLowerCase().startsWith('children:')) {
+        // Legacy hierarchy files: fold both sides into plain links.
+        links = {
+          ...links,
+          ..._parseList(line.substring(line.indexOf(':') + 1))
+        };
       } else if (line.toLowerCase().startsWith('x:')) {
         x = double.tryParse(line.substring(2).trim()) ?? x;
       } else if (line.toLowerCase().startsWith('y:')) {
         y = double.tryParse(line.substring(2).trim()) ?? y;
+      } else if (line.toLowerCase().startsWith('color:')) {
+        color = int.tryParse(line.substring('color:'.length).trim()) ??
+            color;
       }
     }
     if (title == null || title.isEmpty) return null;
-    parents.remove(title);
-    children.remove(title);
+    links.remove(title);
     return WordNode(title,
-        parents: parents, children: children, x: x, y: y);
+        links: links, x: x, y: y, color: color);
   }
 
   static Set<String> _parseList(String s) {

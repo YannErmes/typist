@@ -6,24 +6,19 @@ import 'graph_view.dart';
 import 'storage.dart';
 import 'theme.dart';
 
-/// Bottom sheet that slides up while writing: the full mind-map,
-/// focused on the tagged word, with copy right there.
-///
-/// [focus] is a live notifier — when the tag in the sheet changes to
-/// another exact word, the map refocuses without reopening.
+/// Bottom sheet that slides up from a mention: the mind-map,
+/// opened already scrolled to the mentioned word, with copy at hand.
 class TagGraphSheet extends StatefulWidget {
   final StorageService storage;
   final WordGraph graph;
-  final String mode; // '@' or '#'
-  final ValueNotifier<String> focus;
+  final String word;
   final VoidCallback onGraphChanged;
 
   const TagGraphSheet({
     super.key,
     required this.storage,
     required this.graph,
-    required this.mode,
-    required this.focus,
+    required this.word,
     required this.onGraphChanged,
   });
 
@@ -32,29 +27,8 @@ class TagGraphSheet extends StatefulWidget {
 }
 
 class _TagGraphSheetState extends State<TagGraphSheet> {
-  late String _focus = widget.focus.value;
   String? _picked;
   String? _notice;
-
-  @override
-  void initState() {
-    super.initState();
-    widget.focus.addListener(_onFocus);
-  }
-
-  void _onFocus() {
-    setState(() {
-      _focus = widget.focus.value;
-      _picked = null;
-      _notice = null;
-    });
-  }
-
-  @override
-  void dispose() {
-    widget.focus.removeListener(_onFocus);
-    super.dispose();
-  }
 
   void _copy(String word) {
     Clipboard.setData(ClipboardData(text: word));
@@ -63,9 +37,7 @@ class _TagGraphSheetState extends State<TagGraphSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final current = _picked ?? _focus;
-    final title =
-        widget.mode == '@' ? 'under "@$current"' : 'above "#$current"';
+    final current = _picked ?? widget.word;
     return Container(
       decoration: const BoxDecoration(
         color: PaperTheme.paper,
@@ -92,7 +64,7 @@ class _TagGraphSheetState extends State<TagGraphSheet> {
               children: [
                 Expanded(
                   child: Text(
-                    title,
+                    '"$current" on the map',
                     style: const TextStyle(
                       color: PaperTheme.inkSoft,
                       fontSize: 12,
@@ -133,10 +105,10 @@ class _TagGraphSheetState extends State<TagGraphSheet> {
               borderRadius: const BorderRadius.vertical(
                   bottom: Radius.circular(18)),
               child: GraphView(
-                key: ValueKey(_focus),
+                key: ValueKey(widget.word),
                 storage: widget.storage,
                 graph: widget.graph,
-                initialWord: _focus,
+                initialWord: widget.word,
                 onSelectionChanged: (s) => setState(() {
                   _picked = s;
                   _notice = null;

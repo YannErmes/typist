@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 
@@ -8,15 +11,30 @@ import 'sheet_view.dart';
 import 'storage.dart';
 import 'theme.dart';
 
+/// In-memory record of the last framework crash, so a red screen can be
+/// inspected and copied from inside the app (works in the browser too,
+// end where files can't be written).
+class CrashCenter {
+  static final ValueNotifier<String?> lastCrash = ValueNotifier(null);
+
+  static void record(String text) {
+    lastCrash.value = text;
+    crashStorage?.logCrash(text);
+  }
+}
+
 void main() {
-  // Save crash reports next to the notes so a red screen can be diagnosed
-  // from Documents/WordGraphTool/crash.log afterwards.
-  FlutterError.onError = (details) {
-    crashStorage?.logCrash(
-        '${details.exceptionAsString()}\n${details.stack ?? ''}');
-    FlutterError.presentError(details);
-  };
-  runApp(const WordGraphToolApp());
+  runZonedGuarded(() {
+    FlutterError.onError = (details) {
+      final text =
+          '${details.exceptionAsString()}\n${details.stack ?? ''}';
+      CrashCenter.record(text);
+      FlutterError.presentError(details);
+    };
+    runApp(const WordGraphToolApp());
+  }, (error, stack) {
+    CrashCenter.record('$error\n$stack');
+  });
 }
 
 /// Storage handle used only for crash logging (set once the shell boots).
@@ -72,15 +90,11 @@ class _HomeShellState extends State<HomeShell> {
       final loaded = await _storage.loadGraph();
       _graph.nodes.clear();
       _graph.nodes.addAll(loaded.nodes);
-      // Seed a tiny example on first run so @ / # can be tried immediately.
+      // Seed a tiny example on first run so @ can be tried immediately.
       if (_graph.isEmpty) {
-        _graph.ensure('eat');
-        _graph.ensure('orange');
-        _graph.ensure('tomato');
-        _graph.ensure('meal');
-        _graph.linkParentChild('meal', 'eat');
-        _graph.linkParentChild('eat', 'orange');
-        _graph.linkParentChild('eat', 'tomato');
+        _graph.connect('meal', 'eat');
+        _graph.connect('eat', 'orange');
+        _graph.connect('eat', 'tomato');
         await _storage.saveGraph(_graph);
       }
       if (mounted) setState(() => _ready = true);
@@ -164,6 +178,64 @@ class _HomeShellState extends State<HomeShell> {
                 ),
               ],
             ),
+      floatingActionButton: ValueListenableBuilder<String?>(
+        valueListenable: CrashCenter.lastCrash,
+        builder: (context, crash, _) {
+          if (crash == null) return const SizedBox.shrink();
+          return FloatingActionButton.small(
+            tooltip: 'Something broke — tap to see details',
+            backgroundColor: const Color(0xFF8F2F25),
+            foregroundColor: Colors.white,
+            onPressed: () => _showCrash(context, crash),
+            child: const Icon(Icons.bug_report),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showCrash(BuildContext context, String crash) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF4EEDF),
+        title: const Text('What broke',
+            style: TextStyle(
+                color: PaperTheme.ink,
+                fontSize: 15,
+                fontWeight: FontWeight.w700)),
+        content: SizedBox(
+          width: 520,
+          height: 380,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              crash.length > 6000 ? crash.substring(0, 6000) : crash,
+              style: const TextStyle(
+                  color: PaperTheme.ink, fontSize: 11),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: crash));
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('Copy',
+                style: TextStyle(
+                    color: PaperTheme.ink,
+                    fontWeight: FontWeight.w700)),
+          ),
+          TextButton(
+            onPressed: () {
+              CrashCenter.lastCrash.value = null;
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('Dismiss',
+                style: TextStyle(color: PaperTheme.inkSoft)),
+          ),
+        ],
+      ),
     );
   }
 }
