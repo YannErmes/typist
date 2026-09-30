@@ -103,6 +103,12 @@ class GraphViewState extends State<GraphView> {
   final _linkedCtrl = TextEditingController();
   final _jumpCtrl = TextEditingController();
 
+  /// Live search filter for the word rail (never creates words by itself).
+  String _filter = '';
+
+  /// Viewport size of the canvas area, for scroll-to-word math.
+  Size _viewportSize = Size.zero;
+
   /// Reused for every name dialog. Never disposed mid-flight: disposing a
   /// dialog controller while its route animates out trips rebuilds that
   /// still reference it (red screen). Disposed once with this state.
@@ -117,7 +123,7 @@ class GraphViewState extends State<GraphView> {
   Offset _grabOffset = Offset.zero;
 
   /// Words pinned to an exact canvas spot (double-click placement).
-  Map<String, Offset> _customPos = {};
+  final Map<String, Offset> _customPos = {};
 
   /// Link-drawing mode: drag from one bubble to another to attach them.
   bool _linkMode = false;
@@ -229,11 +235,12 @@ class GraphViewState extends State<GraphView> {
     }
   }
 
-  void _select(String word) {
+  void _select(String word, {bool center = false}) {
     setState(() {
       _selected = WordGraph.norm(word);
       _selEdge = null;
       _linkedCtrl.clear();
+      if (center) _pendingCenter = _selected;
     });
     widget.onSelectionChanged?.call(_selected);
   }
@@ -307,70 +314,6 @@ class GraphViewState extends State<GraphView> {
     return box.localToGlobal(canvasPt);
   }
 
-  /// Tidy button: bloom the map radially around the selected word
-  /// (or the most-linked one) — center with rings around it, like a
-  /// classic mind map. Leftovers form their own ring to the side.
-  void _resetView() {
-    final g = widget.graph;
-    final keys = g.sortedKeys();
-    if (keys.isEmpty) return;
-    String center = _selected ?? '';
-    if (g.get(center) == null) {
-      center = keys.first;
-      var best = -1;
-      for (final k in keys) {
-        final n = g.neighborsOf(k).length;
-        if (n > best) {
-          best = n;
-          center = k;
-        }
-      }
-    }
-    setState(() {
-      _customPos = {};
-      _selEdge = null;
-      const cx = 1100.0;
-      const cy = 750.0;
-      final seen = <String>{center};
-      _customPos[center] = const Offset(cx, cy);
-      var ring = g.neighborsOf(center).where((w) => !seen.contains(w)).toList();
-      var radius = 360.0;
-      while (ring.isNotEmpty) {
-        for (var i = 0; i < ring.length; i++) {
-          final a = 2 * math.pi * i / ring.length - math.pi / 2;
-          _customPos[ring[i]] = Offset(
-            cx + math.cos(a) * radius,
-            cy + math.sin(a) * radius * 0.72,
-          );
-          seen.add(ring[i]);
-        }
-        final next = <String>[];
-        for (final w in ring) {
-          for (final nb in g.neighborsOf(w)) {
-            if (!seen.contains(nb) && !next.contains(nb)) next.add(nb);
-          }
-        }
-        ring = next;
-        radius += 320;
-      }
-      // Disconnected leftovers cascade to the right.
-      var lx = cx + radius + 260;
-      var ly = 300.0;
-      for (final k in keys) {
-        if (seen.contains(k)) continue;
-        _customPos[k] = Offset(lx, ly);
-        ly += 150;
-        if (ly > cy + radius) {
-          ly = 300;
-          lx += 260;
-        }
-      }
-      _pan.value = Matrix4.identity();
-    });
-    _syncPositions();
-    _saveGraphNow();
-    _notice('Bloomed around "$center" — drag anything anywhere.');
-  }
 
   void _notice(String msg) {
     if (!mounted) return;
@@ -661,13 +604,64 @@ class GraphViewState extends State<GraphView> {
     await _persist();
   }
 
-  Future<void> _createOrJump() async {
+  /// Search submit: jump to the exact word, else the first match.
+  /// Only creates when nothing matches at all.
+  Future<void> _jumpSubmit() async {
     final raw = _jumpCtrl.text.trim().toLowerCase();
     if (raw.isEmpty) return;
-    widget.graph.ensure(raw);
-    await _persist();
-    _select(raw);
+    final matches = _filteredKeys();
+    final exact = [for (final k in matches) if (k == raw) k];
+    if (exact.isNotEmpty) {
+      _select(exact.first, center: true);
+    } else if (matches.isNotEmpty) {
+      _select(matches.first, center: true);
+    } else {
+      await _createWord(raw, nearView: true);
+    }
+  }
+
+  /// Explicit creation (never implied by searching).
+  Future<void> _createWord(String raw, {bool nearView = false}) async {
+    final name = raw.trim().toLowerCase();
+    if (name.isEmpty) return;
+    final isNew = widget.graph.get(name) == null;
+    widget.graph.ensure(name);
+    if (isNew) {
+      final at = nearView ? _viewCenterCanvas() : null;
+      if (at != null) {
+        setState(() => _customPos[name] = at);
+      }
+      _notice('"$name" created.');
+    }
     _jumpCtrl.clear();
+    setState(() => _filter = '');
+    _select(name, center: true);
+    await _persist();
+  }
+
+  /// Canvas point currently at the middle of the viewport.
+  Offset _viewCenterCanvas() {
+    final s = _pan.value.getMaxScaleOnAxis().clamp(0.3, 2.5);
+    final t = _pan.value.getTranslation();
+    final vw = _viewportSize.width;
+    final vh = _viewportSize.height;
+    if (vw <= 0 || vh <= 0) return const Offset(600, 500);
+    return Offset((vw / 2 - t.x) / s, (vh / 2 - t.y) / s);
+  }
+
+  List<String> _filteredKeys() {
+    final keys = widget.graph.sortedKeys();
+    final f = _filter.trim().toLowerCase();
+    if (f.isEmpty) return keys;
+    final starts = [
+      for (final k in keys)
+        if (k.startsWith(f)) k
+    ];
+    final contains = [
+      for (final k in keys)
+        if (!k.startsWith(f) && k.contains(f)) k
+    ];
+    return [...starts, ...contains];
   }
 
   Future<void> _deleteSelected() async {
@@ -831,6 +825,10 @@ class GraphViewState extends State<GraphView> {
     _lastPlaced = {for (final p in laid.placed) p.word: p.center};
     _lastEdges = laid.edges;
     _lastCanvas = laid.canvas;
+    final shown = _filteredKeys();
+    final typed = _jumpCtrl.text.trim().toLowerCase();
+    final showCreateRow =
+        typed.isNotEmpty && widget.graph.get(typed) == null;
 
     return Container(
       color: PaperTheme.paper,
@@ -850,32 +848,72 @@ class GraphViewState extends State<GraphView> {
               children: [
                 Padding(
                   padding: const EdgeInsets.all(10),
-                  child: TextField(
-                    controller: _jumpCtrl,
-                    onSubmitted: (_) => _createOrJump(),
-                    style: const TextStyle(
-                        color: PaperTheme.ink, fontSize: 13),
-                    decoration: InputDecoration(
-                      hintText: 'new / find word…',
-                      hintStyle: const TextStyle(
-                          color: PaperTheme.inkSoft, fontSize: 12),
-                      filled: true,
-                      fillColor: PaperTheme.surface,
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 8),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(18),
-                        borderSide: const BorderSide(
-                            color: PaperTheme.lineThin),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          key: const ValueKey('graph-search'),
+                          controller: _jumpCtrl,
+                          onChanged: (_) =>
+                              setState(() => _filter = _jumpCtrl.text),
+                          onSubmitted: (_) => _jumpSubmit(),
+                          style: const TextStyle(
+                              color: PaperTheme.ink, fontSize: 13),
+                          decoration: InputDecoration(
+                            hintText: 'find a word…',
+                            hintStyle: const TextStyle(
+                                color: PaperTheme.inkSoft,
+                                fontSize: 12),
+                            filled: true,
+                            fillColor: PaperTheme.surface,
+                            contentPadding:
+                                const EdgeInsets.symmetric(
+                                    horizontal: 10, vertical: 8),
+                            border: OutlineInputBorder(
+                              borderRadius:
+                                  BorderRadius.circular(18),
+                              borderSide: const BorderSide(
+                                  color: PaperTheme.lineThin),
+                            ),
+                            enabledBorder: OutlineInputBorder(
+                              borderRadius:
+                                  BorderRadius.circular(18),
+                              borderSide: const BorderSide(
+                                  color: PaperTheme.lineThin),
+                            ),
+                            suffixIcon: _filter.isEmpty
+                                ? const Icon(Icons.search,
+                                    size: 16,
+                                    color: PaperTheme.inkSoft)
+                                : InkWell(
+                                    onTap: () {
+                                      _jumpCtrl.clear();
+                                      setState(
+                                          () => _filter = '');
+                                    },
+                                    borderRadius:
+                                        BorderRadius.circular(12),
+                                    child: const Icon(Icons.close,
+                                        size: 15,
+                                        color: PaperTheme.inkSoft),
+                                  ),
+                          ),
+                        ),
                       ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(18),
-                        borderSide: const BorderSide(
-                            color: PaperTheme.lineThin),
+                      const SizedBox(width: 6),
+                      IconButton(
+                        tooltip: 'Create a new word here',
+                        onPressed: () async {
+                          final name = await _askWordName(
+                              title: 'New word',
+                              hint: 'e.g. snack');
+                          if (name == null || !mounted) return;
+                          await _createWord(name, nearView: true);
+                        },
+                        icon: const Icon(Icons.add,
+                            size: 18, color: PaperTheme.ink),
                       ),
-                      suffixIcon: const Icon(Icons.search,
-                          size: 16, color: PaperTheme.inkSoft),
-                    ),
+                    ],
                   ),
                 ),
                 Expanded(
@@ -883,19 +921,46 @@ class GraphViewState extends State<GraphView> {
                       ? const Padding(
                           padding: EdgeInsets.all(12),
                           child: Text(
-                            'No words yet.\nCreate one above, e.g. eat.',
+                            'No words yet.\nCreate one with + above, e.g. eat.',
                             style: TextStyle(
                                 color: PaperTheme.inkSoft,
                                 fontSize: 12),
                           ),
                         )
                       : ListView.builder(
-                          itemCount: keys.length,
+                          itemCount:
+                              shown.length + (showCreateRow ? 1 : 0),
                           itemBuilder: (context, i) {
-                            final k = keys[i];
+                            if (showCreateRow && i == shown.length) {
+                              return InkWell(
+                                onTap: () => _createWord(typed,
+                                    nearView: true),
+                                borderRadius:
+                                    BorderRadius.circular(14),
+                                child: Container(
+                                  margin: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 2),
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 12, vertical: 7),
+                                  decoration: BoxDecoration(
+                                    color: PaperTheme.chip,
+                                    borderRadius:
+                                        BorderRadius.circular(14),
+                                  ),
+                                  child: Text('+ Create "$typed"',
+                                      style: const TextStyle(
+                                        color: PaperTheme.ink,
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w600,
+                                      )),
+                                ),
+                              );
+                            }
+                            final k = shown[i];
                             final active = k == _selected;
                             return InkWell(
-                              onTap: () => _select(k),
+                              onTap: () =>
+                                  _select(k, center: true),
                               borderRadius: BorderRadius.circular(14),
                               child: Container(
                                 margin: const EdgeInsets.symmetric(
@@ -1032,6 +1097,7 @@ class GraphViewState extends State<GraphView> {
                         )
                       : LayoutBuilder(
                           builder: (ctx, cons) {
+                            _viewportSize = cons.biggest;
                             if (_pendingCenter != null) {
                               final target = _pendingCenter!;
                               _pendingCenter = null;
@@ -1294,15 +1360,6 @@ class GraphViewState extends State<GraphView> {
                                               PaperTheme.inkSoft),
                                     ),
                                     IconButton(
-                                      tooltip: 'Bloom: radial mind-map tidy',
-                                      onPressed: _resetView,
-                                      icon: const Icon(
-                                          Icons.center_focus_weak,
-                                          size: 16,
-                                          color:
-                                              PaperTheme.inkSoft),
-                                    ),
-                                    IconButton(
                                       tooltip: 'Zoom in',
                                       onPressed: () =>
                                           _zoom(1.2),
@@ -1319,7 +1376,7 @@ class GraphViewState extends State<GraphView> {
                               left: 12,
                               bottom: 14,
                               child: Text(
-                                'drag bubbles to arrange (they stay) · click a line to cut it · double-click space: new word · bloom button: radial tidy',
+                                'drag bubbles to arrange (they stay) · click a line to cut it · double-click space: new word · link tool: drag bubble to bubble',
                                 style: TextStyle(
                                     color: PaperTheme.inkSoft,
                                     fontSize: 10),

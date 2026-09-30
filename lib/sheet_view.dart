@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_quill/flutter_quill.dart'
     show
+        BackgroundAttribute,
         Document,
         IconButtonData,
         QuillController,
@@ -21,6 +22,25 @@ import 'graph_model.dart';
 import 'storage.dart';
 import 'tag_sheet.dart';
 import 'theme.dart';
+
+/// Fill marking words that exist on the mind-map (stored lowercase).
+const String _matchRedHex = '#f69697';
+
+/// Whole-word, case-insensitive ranges of [words] inside [text].
+/// Longest words first so ties prefer the fullest match.
+List<(int, int)> findGraphMatches(String text, List<String> words) {
+  final result = <(int, int)>[];
+  final keys = words.where((w) => w.trim().isNotEmpty).toList();
+  if (keys.isEmpty || text.isEmpty) return result;
+  final escaped = keys.map(RegExp.escape).toList()
+    ..sort((a, b) => b.length.compareTo(a.length));
+  final re =
+      RegExp('\\b(?:${escaped.join('|')})\\b', caseSensitive: false);
+  for (final m in re.allMatches(text)) {
+    result.add((m.start, m.end));
+  }
+  return result;
+}
 
 /// Writing view: titled sessions in a left rail, a styled editor
 /// (bold / italic / underline / text color / highlight / headers / lists)
@@ -48,6 +68,8 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   late final ScrollController _scrollCtrl;
   final TextEditingController _titleCtrl = TextEditingController();
   final Debouncer _saver = Debouncer(const Duration(milliseconds: 500));
+  final Debouncer _highlighter = Debouncer(const Duration(milliseconds: 600));
+  bool _applyingHighlight = false;
 
   List<WritingSession> _sessions = [];
   String? _activeId;
@@ -170,12 +192,69 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
 
   void _onDocChanged() {
     if (_switching || !_loaded || _activeId == null) return;
+    if (_applyingHighlight) return; // our own green paint, not typing
     final id = _activeId!;
     final title = _titleCtrl.text.trim();
     _saver.call(() => widget.storage.saveSession(id, title, _deltaJson()));
     final onImg = _caretOnImage();
     if (onImg != _onImage) setState(() => _onImage = onImg);
     _updateLookup();
+    _highlighter.call(_applyHighlight);
+  }
+
+  /// Paint every graph word red; lift red that no longer matches.
+  /// Only touches our own red — the user's other colors are left alone.
+  void _applyHighlight() {
+    if (!mounted || _switching || !_loaded || _applyingHighlight) return;
+    _applyingHighlight = true;
+    try {
+      final ranges = findGraphMatches(
+          _quill.document.toPlainText(), widget.graph.sortedKeys());
+      final current = _currentGreenRanges();
+      bool covers(List<(int, int)> list, int s, int e) {
+        for (final r in list) {
+          if (r.$1 <= s && r.$2 >= e) return true;
+        }
+        return false;
+      }
+
+      for (final r in current) {
+        if (!covers(ranges, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const BackgroundAttribute(null));
+        }
+      }
+      for (final r in ranges) {
+        if (!covers(current, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const BackgroundAttribute(_matchRedHex));
+        }
+      }
+    } catch (_) {
+      // Never interrupt writing for highlight housekeeping.
+    } finally {
+      _applyingHighlight = false;
+    }
+  }
+
+  /// Live ranges currently wearing our red.
+  List<(int, int)> _currentGreenRanges() {
+    final out = <(int, int)>[];
+    var pos = 0;
+    try {
+      for (final op in _quill.document.toDelta().toList()) {
+        final data = op.data;
+        final len = data is String ? data.length : 1;
+        final attrs = op.attributes;
+        final bg = attrs == null ? null : attrs['background'];
+        if (bg != null &&
+            bg.toString().toLowerCase() == _matchRedHex) {
+          out.add((pos, pos + len));
+        }
+        pos += len;
+      }
+    } catch (_) {}
+    return out;
   }
 
   /// True when the caret sits right on an image embed.
@@ -229,6 +308,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   void dispose() {
     _saveNow();
     _saver.dispose();
+    _highlighter.dispose();
     _removeOverlay();
     WidgetsBinding.instance.removeObserver(this);
     _quill.removeListener(_onDocChanged);
@@ -518,9 +598,10 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   // Bottom-sheet tag flow removed; @mentions insert the word directly.
 
   /// Called by the shell when the graph changes; the popup reads the live
-  /// graph object, so a refresh is just a re-lookup.
+  /// graph object, so a refresh is just a re-lookup (plus re-highlight).
   void refreshGraph() {
     if (_overlay != null) _updateLookup();
+    _highlighter.call(_applyHighlight);
   }
 
   /// Test hook: types text at the end of the note as if the user typed it.
@@ -534,6 +615,16 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   /// Test hook: current plain text of the note.
   @visibleForTesting
   String debugPlainText() => _quill.document.toPlainText();
+
+  /// Test hook: current document delta as JSON.
+  @visibleForTesting
+  String debugDeltaJson() {
+    try {
+      return jsonEncode(_quill.document.toDelta().toJson());
+    } catch (_) {
+      return '';
+    }
+  }
 
   /// Insert "@" at the cursor (toolbar button).
   void _onAtButton() {

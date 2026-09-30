@@ -5,7 +5,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:word_graph_tool/graph_model.dart';
 import 'package:word_graph_tool/graph_view.dart';
 import 'package:word_graph_tool/main.dart';
-import 'package:word_graph_tool/sheet_view.dart';
+import 'package:word_graph_tool/sheet_view.dart'
+    show SheetView, SheetViewState, findGraphMatches;
 import 'package:word_graph_tool/storage.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
 
@@ -21,6 +22,20 @@ void main() {
     g.disconnect('meal', 'eat');
     expect(g.linked('eat', 'meal'), isFalse);
     expect(g.neighborsOf('eat').toSet(), {'food', 'orange'});
+  });
+
+  test('graph matches are whole words, case-insensitive', () {
+    const words = ['eat', 'meal', 'orange'];
+    final hits = findGraphMatches(
+        'I eat an EATERY with meal and ORANGE.', words);
+    final texts = [
+      for (final h in hits)
+        'I eat an EATERY with meal and ORANGE.'.substring(h.$1, h.$2)
+    ];
+    expect(texts, ['eat', 'meal', 'ORANGE']);
+    expect(findGraphMatches('nothing here', words), isEmpty);
+    expect(findGraphMatches('', words), isEmpty);
+    expect(findGraphMatches('eat eat', words), [(0, 3), (4, 7)]);
   });
 
   test('graph renames keeping links, position and color', () {
@@ -97,6 +112,27 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(const Duration(milliseconds: 500));
     expect(find.byType(TagGraphSheet), findsNothing);
+  });
+
+  testWidgets('graph words turn green while writing',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    final sheetState =
+        tester.state<SheetViewState>(find.byType(SheetView));
+    sheetState.typeForTest('I love orange juice');
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(sheetState.debugDeltaJson(), contains('f69697'));
+    // Editing it away lifts the green again.
+    sheetState.typeForTest(' and more');
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(sheetState.debugDeltaJson(), contains('f69697'));
   });
 
   testWidgets('tapping a link selects it and the chip deletes it',
@@ -186,6 +222,35 @@ void main() {
     expect(find.text('New word'), findsNothing);
     expect(find.text('yann'), findsWidgets);
   }, timeout: const Timeout(Duration(seconds: 90)));
+
+  testWidgets('rail search filters without creating; pick scrolls to word',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('Graph'));
+    await tester.pump(const Duration(milliseconds: 500));
+    final state =
+        tester.state<GraphViewState>(find.byType(GraphView).first);
+    final search = find.byKey(const ValueKey('graph-search'));
+    // Unknown word: offered for creation, never auto-created.
+    await tester.enterText(search, 'zzz');
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(state.widget.graph.get('zzz'), isNull);
+    expect(find.text('+ Create "zzz"'), findsOneWidget);
+    await tester.tap(find.text('+ Create "zzz"'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(state.widget.graph.get('zzz'), isNotNull);
+    // Existing word: pick the match to select it.
+    await tester.enterText(search, 'eat');
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.tap(find.text('eat').first);
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.byIcon(Icons.edit_outlined), findsOneWidget);
+  });
 
   testWidgets('app boots to sheet view', (WidgetTester tester) async {
     await tester.pumpWidget(const WordGraphToolApp());
