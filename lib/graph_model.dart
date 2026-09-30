@@ -5,9 +5,16 @@ class WordNode {
   Set<String> parents;
   Set<String> children;
 
-  WordNode(this.name, {Set<String>? parents, Set<String>? children})
+  /// Saved canvas position (mind-map placement). Null = auto-place.
+  double? x;
+  double? y;
+
+  WordNode(this.name,
+      {Set<String>? parents, Set<String>? children, this.x, this.y})
       : parents = parents ?? <String>{},
         children = children ?? <String>{};
+
+  bool get hasPos => x != null && y != null;
 }
 
 class WordGraph {

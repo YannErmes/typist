@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:flutter_quill/flutter_quill.dart';
 
 import 'graph_model.dart';
 import 'graph_view.dart';
@@ -7,8 +9,18 @@ import 'storage.dart';
 import 'theme.dart';
 
 void main() {
+  // Save crash reports next to the notes so a red screen can be diagnosed
+  // from Documents/WordGraphTool/crash.log afterwards.
+  FlutterError.onError = (details) {
+    crashStorage?.logCrash(
+        '${details.exceptionAsString()}\n${details.stack ?? ''}');
+    FlutterError.presentError(details);
+  };
   runApp(const WordGraphToolApp());
 }
+
+/// Storage handle used only for crash logging (set once the shell boots).
+StorageService? crashStorage;
 
 class WordGraphToolApp extends StatelessWidget {
   const WordGraphToolApp({super.key});
@@ -19,6 +31,12 @@ class WordGraphToolApp extends StatelessWidget {
       title: 'Word Graph Tool',
       debugShowCheckedModeBanner: false,
       theme: PaperTheme.theme(),
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        FlutterQuillLocalizations.delegate,
+      ],
       home: const HomeShell(),
     );
   }
@@ -44,6 +62,7 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void initState() {
     super.initState();
+    crashStorage = _storage;
     _boot();
   }
 
@@ -79,8 +98,20 @@ class _HomeShellState extends State<HomeShell> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Word Graph Tool',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(7),
+              child: Image.asset('assets/logo.png',
+                  width: 28, height: 28),
+            ),
+            const SizedBox(width: 10),
+            const Text('Word Graph Tool',
+                style:
+                    TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+          ],
+        ),
         actions: [
           TextButton.icon(
             onPressed: () => setState(() => _tab = 0),

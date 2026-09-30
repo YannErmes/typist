@@ -1,15 +1,30 @@
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter_quill/flutter_quill.dart'
+    show
+        Document,
+        IconButtonData,
+        QuillController,
+        QuillEditor,
+        QuillEditorConfig,
+        QuillIconTheme,
+        QuillSimpleToolbar,
+        QuillSimpleToolbarConfig,
+        StyleAttribute,
+        getEmbedNode;
+import 'package:flutter_quill_extensions/flutter_quill_extensions.dart';
 
 import 'graph_model.dart';
 import 'storage.dart';
 import 'tag_sheet.dart';
 import 'theme.dart';
 
-/// Free-writing surface.
-///
-/// Finish a word after `@` / `#` (at least 2 letters, matching a known
-/// word) and the mind-map slides up as a bottom sheet, focused on that
-/// word — pick what you need and copy it straight from the graph.
+/// Writing view: titled sessions in a left rail, a styled editor
+/// (bold / italic / underline / text color / highlight / headers / lists)
+/// and the @ / # tag flow — finishing a known word slides the mind-map
+/// up as a bottom sheet focused on that word.
 class SheetView extends StatefulWidget {
   final StorageService storage;
   final WordGraph graph;
@@ -27,11 +42,17 @@ class SheetView extends StatefulWidget {
 }
 
 class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
-  late final TextEditingController _controller;
+  late QuillController _quill;
   late final FocusNode _focusNode;
+  late final ScrollController _scrollCtrl;
+  final TextEditingController _titleCtrl = TextEditingController();
   final Debouncer _saver = Debouncer(const Duration(milliseconds: 500));
 
+  List<WritingSession> _sessions = [];
+  String? _activeId;
   bool _loaded = false;
+  bool _switching = false; // guards programmatic controller updates
+  bool _onImage = false; // caret sits on an image embed
 
   // Bottom-sheet session for the current tag.
   bool _sheetOpen = false;
@@ -42,30 +63,174 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _controller = TextEditingController();
+    _quill = QuillController.basic();
     _focusNode = FocusNode();
-    _controller.addListener(_onTextChanged);
-    _load();
+    _scrollCtrl = ScrollController();
+    _quill.addListener(_onDocChanged);
+    _titleCtrl.addListener(_onTitleChanged);
+    _boot();
   }
 
-  Future<void> _load() async {
-    final text = await widget.storage.loadSheet();
+  Future<void> _boot() async {
+    var sessions = await widget.storage.loadSessions();
+    // One-time upgrade: fold the old single sheet.txt into a session.
+    final legacy = await widget.storage.takeLegacySheet();
+    if (legacy != null) {
+      final created =
+          await widget.storage.createSession(legacy.title);
+      await widget.storage
+          .saveSession(created.id, legacy.title, legacy.deltaJson);
+      sessions = await widget.storage.loadSessions();
+    }
+    if (sessions.isEmpty) {
+      final created =
+          await widget.storage.createSession('First notes');
+      sessions = [created];
+    }
     if (!mounted) return;
-    _controller.removeListener(_onTextChanged);
-    _controller.text = text;
-    _controller.addListener(_onTextChanged);
-    setState(() => _loaded = true);
+    setState(() {
+      _sessions = sessions;
+      _activeId = sessions.first.id;
+      _loaded = true;
+    });
+    await _openSession(sessions.first.id);
+  }
+
+  Future<void> _openSession(String id) async {
+    await _saveNow(); // never lose the session we leave
+    final delta = await widget.storage.loadSessionDelta(id);
+    if (!mounted) return;
+    _switching = true;
+    try {
+      if (delta == null || delta.isEmpty) {
+        _quill.document = Document();
+      } else {
+        _quill.document =
+            Document.fromJson(jsonDecode(delta) as List);
+      }
+      final session =
+          _sessions.firstWhere((s) => s.id == id);
+      _titleCtrl.text = session.title;
+      setState(() => _activeId = id);
+    } catch (_) {
+      _quill.document = Document();
+    } finally {
+      _switching = false;
+    }
+  }
+
+  Future<void> _newSession() async {
+    await _saveNow();
+    final created = await widget.storage.createSession(
+        'Untitled ${_sessions.length + 1}');
+    if (!mounted) return;
+    setState(() {
+      _sessions = [created, ..._sessions];
+    });
+    await _openSession(created.id);
+  }
+
+  Future<void> _deleteSession(String id) async {
+    await widget.storage.deleteSession(id);
+    if (!mounted) return;
+    final remaining =
+        _sessions.where((s) => s.id != id).toList();
+    if (remaining.isEmpty) {
+      final created =
+          await widget.storage.createSession('First notes');
+      setState(() {
+        _sessions = [created];
+      });
+      await _openSession(created.id);
+    } else {
+      setState(() => _sessions = remaining);
+      if (_activeId == id) await _openSession(remaining.first.id);
+    }
+  }
+
+  String _deltaJson() {
+    try {
+      return jsonEncode(_quill.document.toDelta().toJson());
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> _saveNow() async {
+    final id = _activeId;
+    if (id == null || !_loaded) return;
+    await widget.storage
+        .saveSession(id, _titleCtrl.text.trim(), _deltaJson());
+  }
+
+  void _onDocChanged() {
+    if (_switching || !_loaded || _activeId == null) return;
+    final id = _activeId!;
+    final title = _titleCtrl.text.trim();
+    _saver.call(() => widget.storage.saveSession(id, title, _deltaJson()));
+    final onImg = _caretOnImage();
+    if (onImg != _onImage) setState(() => _onImage = onImg);
+    _updateLookup();
+  }
+
+  /// True when the caret sits right on an image embed.
+  bool _caretOnImage() {
+    try {
+      final res = getEmbedNode(_quill, _quill.selection.start);
+      return res.value.value.type == 'image';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Move the image at the caret left / center / right.
+  void _alignImage(String align) {
+    try {
+      final res = getEmbedNode(_quill, _quill.selection.start);
+      if (res.value.value.type != 'image') return;
+      final cur = res.value.style.attributes['style']?.value
+              ?.toString() ??
+          '';
+      final parts = <String, String>{};
+      for (final d in cur.split(';')) {
+        final i = d.indexOf(':');
+        if (i > 0) {
+          parts[d.substring(0, i).trim()] =
+              d.substring(i + 1).trim();
+        }
+      }
+      parts['alignment'] = align;
+      final next =
+          parts.entries.map((e) => '${e.key}: ${e.value}').join('; ');
+      _quill.formatText(res.offset, 1, StyleAttribute(next));
+    } catch (_) {}
+  }
+
+  void _onTitleChanged() {
+    if (_switching || !_loaded || _activeId == null) return;
+    final title = _titleCtrl.text.trim();
+    for (final s in _sessions) {
+      if (s.id == _activeId) {
+        s.title = title.isEmpty ? 'Untitled' : title;
+        break;
+      }
+    }
+    final id = _activeId!;
+    _saver.call(() => widget.storage.saveSession(id, title, _deltaJson()));
+    setState(() {}); // refresh rail titles
   }
 
   @override
   void dispose() {
-    // Save when the app closes / view is torn down so nothing is lost.
-    widget.storage.saveSheet(_controller.text);
+    _saveNow();
     _saver.dispose();
     _focusNote?.dispose();
     WidgetsBinding.instance.removeObserver(this);
-    _controller.dispose();
+    _quill.removeListener(_onDocChanged);
+    _quill.dispose();
+    _titleCtrl.dispose();
     _focusNode.dispose();
+    _scrollCtrl.dispose();
     super.dispose();
   }
 
@@ -74,24 +239,16 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     if (state == AppLifecycleState.detached ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused) {
-      widget.storage.saveSheet(_controller.text);
+      _saveNow();
     }
-  }
-
-  void _onTextChanged() {
-    // Silent continuous save, debounced ~500ms after last keystroke.
-    final text = _controller.text;
-    _saver.call(() => widget.storage.saveSheet(text));
-    _updateLookup();
   }
 
   // ---- Tag detection (@word / #word before the cursor) ----
   ({String mode, String word})? _detectTrigger() {
-    final text = _controller.text;
-    final sel = _controller.selection;
+    final text = _quill.document.toPlainText();
+    final sel = _quill.selection;
     if (!sel.isValid || sel.baseOffset < 0) return null;
     final cursor = sel.baseOffset.clamp(0, text.length);
-    // Walk backwards while chars are word chars.
     int i = cursor - 1;
     while (i >= 0 && _isWordChar(text[i])) {
       i--;
@@ -99,7 +256,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     if (i < 0) return null;
     final sigil = text[i];
     if (sigil != '@' && sigil != '#') return null;
-    // Sigil must start a token (start or whitespace/newline before it).
     if (i > 0 && !_isBoundary(text[i - 1])) return null;
     final word = text.substring(i + 1, cursor).toLowerCase();
     return (mode: sigil, word: word);
@@ -110,9 +266,11 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       ch == ' ' || ch == '\n' || ch == '\t' || ch == '(' || ch == '"';
 
   void _updateLookup() {
-    if (!_loaded || _sheetOpen) {
-      // While the sheet is open, keep it focused on the tag being typed.
-      if (_sheetOpen) _refocusFromTag();
+    if (!_loaded || _activeId == null) return;
+    // Never hijack an active text selection with the map sheet.
+    if (_quill.selection.start != _quill.selection.end) return;
+    if (_sheetOpen) {
+      _refocusFromTag();
       return;
     }
     final trig = _detectTrigger();
@@ -164,7 +322,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       _sheetOpen = false;
       _focusNote?.dispose();
       _focusNote = null;
-      // Hand the keyboard straight back so writing continues.
       if (mounted) _focusNode.requestFocus();
     });
   }
@@ -173,8 +330,14 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   /// same live graph object, so there is nothing to refresh here.
   void refreshGraph() {}
 
-  /// Insert "@" or "#" at the cursor (toolbar buttons).
-  /// If the cursor sits on a finished word, open its map instead.
+  /// Test hook: types text at the end of the note as if the user typed it.
+  @visibleForTesting
+  void typeForTest(String text) {
+    final at = _quill.document.length - 1;
+    _quill.replaceText(at, 0, text,
+        TextSelection.collapsed(offset: at + text.length));
+  }
+
   void _onSigilButton(String sigil) {
     final trig = _detectTrigger();
     if (trig != null &&
@@ -184,21 +347,347 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       _updateLookup();
       return;
     }
-    _insertSigil(sigil);
+    // Insert the sigil at the cursor.
+    final pos = _quill.selection.baseOffset;
+    final len = _quill.document.length;
+    final at = pos < 0 ? len - 1 : pos.clamp(0, len - 1);
+    _quill.replaceText(at, 0, sigil, null);
+    _focusNode.requestFocus();
   }
 
-  void _insertSigil(String sigil) {
-    final text = _controller.text;
-    final sel = _controller.selection;
-    final cursor =
-        sel.isValid ? sel.baseOffset.clamp(0, text.length) : text.length;
-    final next =
-        '${text.substring(0, cursor)}$sigil${text.substring(cursor)}';
-    _controller.value = TextEditingValue(
-      text: next,
-      selection: TextSelection.collapsed(offset: cursor + 1),
+  String _dateLabel(int ms) {
+    final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+    final now = DateTime.now();
+    if (dt.year == now.year &&
+        dt.month == now.month &&
+        dt.day == now.day) {
+      return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    }
+    return '${dt.day}/${dt.month}/${dt.year}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      color: PaperTheme.paper,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Sessions rail.
+          Container(
+            width: 216,
+            decoration: const BoxDecoration(
+              color: PaperTheme.paperDark,
+              border: Border(
+                  right: BorderSide(color: PaperTheme.lineThin)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 12, 6, 4),
+                  child: Row(
+                    children: [
+                      const Text('NOTES',
+                          style: TextStyle(
+                              color: PaperTheme.inkSoft,
+                              fontSize: 11,
+                              letterSpacing: 1.2)),
+                      const Spacer(),
+                      IconButton(
+                        tooltip: 'New note',
+                        onPressed: _loaded ? _newSession : null,
+                        icon: const Icon(Icons.add,
+                            size: 18, color: PaperTheme.ink),
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: !_loaded
+                      ? const Center(
+                          child: SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2)))
+                      : ListView.builder(
+                          itemCount: _sessions.length,
+                          itemBuilder: (context, i) {
+                            final s = _sessions[i];
+                            final active = s.id == _activeId;
+                            return InkWell(
+                              onTap: () {
+                                if (s.id != _activeId) {
+                                  _openSession(s.id);
+                                }
+                              },
+                              borderRadius:
+                                  BorderRadius.circular(12),
+                              child: Container(
+                                margin: const EdgeInsets.symmetric(
+                                    horizontal: 8, vertical: 2),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 10, vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: active
+                                      ? PaperTheme.chip
+                                      : Colors.transparent,
+                                  borderRadius:
+                                      BorderRadius.circular(12),
+                                ),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(s.title,
+                                              overflow:
+                                                  TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                color: PaperTheme.ink,
+                                                fontSize: 13,
+                                                fontWeight: active
+                                                    ? FontWeight.w600
+                                                    : FontWeight.normal,
+                                              )),
+                                          Text(_dateLabel(s.updatedAt),
+                                              style: const TextStyle(
+                                                  color: PaperTheme
+                                                      .inkSoft,
+                                                  fontSize: 10)),
+                                        ],
+                                      ),
+                                    ),
+                                    InkWell(
+                                      onTap: () =>
+                                          _deleteSession(s.id),
+                                      borderRadius:
+                                          BorderRadius.circular(8),
+                                      child: const Padding(
+                                        padding: EdgeInsets.all(4),
+                                        child: Icon(Icons.close,
+                                            size: 13,
+                                            color:
+                                                PaperTheme.inkSoft),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          ),
+          // Editor side.
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.all(20),
+              child: Center(
+                child: ConstrainedBox(
+                  constraints:
+                      const BoxConstraints(maxWidth: 780),
+                  child: Container(
+                    padding: const EdgeInsets.fromLTRB(24, 14, 24, 18),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFEFE8D6),
+                      border: Border.all(
+                          color: PaperTheme.lineThin, width: 1),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: !_loaded
+                        ? const Center(
+                            child: Padding(
+                              padding: EdgeInsets.all(32),
+                              child: SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: CircularProgressIndicator(
+                                    strokeWidth: 2),
+                              ),
+                            ),
+                          )
+                        : Column(
+                            crossAxisAlignment:
+                                CrossAxisAlignment.stretch,
+                            children: [
+                              // Title of this writing session.
+                              TextField(
+                                controller: _titleCtrl,
+                                style: const TextStyle(
+                                  color: PaperTheme.ink,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                                cursorColor: PaperTheme.ink,
+                                decoration: const InputDecoration(
+                                  hintText: 'Untitled',
+                                  hintStyle: TextStyle(
+                                      color: PaperTheme.inkSoft),
+                                  border: InputBorder.none,
+                                  isDense: true,
+                                  contentPadding:
+                                      EdgeInsets.symmetric(
+                                          vertical: 4),
+                                ),
+                              ),
+                              Row(
+                                children: [
+                                  _sigilButton('@', 'children',
+                                      () => _onSigilButton('@')),
+                                  const SizedBox(width: 8),
+                                  _sigilButton('#', 'parents',
+                                      () => _onSigilButton('#')),
+                                  const SizedBox(width: 8),
+                                  const Expanded(
+                                    child: Text(
+                                      'finish the word — its map slides up',
+                                      textAlign: TextAlign.right,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          color: PaperTheme.inkSoft,
+                                          fontSize: 10.5),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              // Styling tools, kept in the paper palette.
+                              QuillSimpleToolbar(
+                                controller: _quill,
+                                config: QuillSimpleToolbarConfig(
+                                  embedButtons:
+                                      FlutterQuillEmbeds.toolbarButtons(),
+                                  multiRowsDisplay: false,
+                                  showDividers: false,
+                                  showFontFamily: false,
+                                  showFontSize: false,
+                                  showSmallButton: false,
+                                  showLineHeightButton: false,
+                                  showStrikeThrough: false,
+                                  showInlineCode: false,
+                                  showColorButton: true,
+                                  showBackgroundColorButton: true,
+                                  showClearFormat: true,
+                                  showAlignmentButtons: false,
+                                  showHeaderStyle: true,
+                                  showListNumbers: true,
+                                  showListBullets: true,
+                                  showListCheck: false,
+                                  showCodeBlock: false,
+                                  showQuote: true,
+                                  showIndent: false,
+                                  showLink: true,
+                                  showSearchButton: false,
+                                  showSubscript: false,
+                                  showSuperscript: false,
+                                  color: Colors.transparent,
+                                  iconTheme: QuillIconTheme(
+                                    iconButtonUnselectedData:
+                                        IconButtonData(
+                                            color:
+                                                PaperTheme.inkSoft),
+                                    iconButtonSelectedData:
+                                        IconButtonData(
+                                            color: PaperTheme.ink),
+                                  ),
+                                ),
+                              ),
+                              const Divider(
+                                  height: 12,
+                                  color: PaperTheme.lineThin),
+                              // Image tools appear while the caret is on a picture.
+                              if (_onImage)
+                                Padding(
+                                  padding: const EdgeInsets.only(
+                                      top: 2, bottom: 6),
+                                  child: Row(
+                                    children: [
+                                      const Text('Image: ',
+                                          style: TextStyle(
+                                              color:
+                                                  PaperTheme.inkSoft,
+                                              fontSize: 11)),
+                                      _alignBtn(
+                                          'Left',
+                                          'centerLeft',
+                                          Icons.format_align_left),
+                                      _alignBtn(
+                                          'Center',
+                                          'center',
+                                          Icons.format_align_center),
+                                      _alignBtn(
+                                          'Right',
+                                          'centerRight',
+                                          Icons.format_align_right),
+                                    ],
+                                  ),
+                                ),
+                              Expanded(
+                                child: QuillEditor.basic(
+                                  controller: _quill,
+                                  focusNode: _focusNode,
+                                  scrollController: _scrollCtrl,
+                                  config: QuillEditorConfig(
+                                    embedBuilders: kIsWeb
+                                        ? FlutterQuillEmbeds
+                                            .editorWebBuilders()
+                                        : FlutterQuillEmbeds
+                                            .editorBuilders(),
+                                    // Keep single-line: quill embeds the
+                                    // placeholder raw in JSON (newlines crash it).
+                                    placeholder:
+                                        'Write freely… type @eat to open its map.',
+                                    autoFocus: true,
+                                    scrollable: true,
+                                    padding: EdgeInsets.symmetric(
+                                        vertical: 8),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
-    _focusNode.requestFocus();
+  }
+
+  Widget _alignBtn(String label, String align, IconData icon) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6),
+      child: InkWell(
+        onTap: () => _alignImage(align),
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding:
+              const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+          decoration: BoxDecoration(
+            color: PaperTheme.surface,
+            border: Border.all(color: PaperTheme.lineThin),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 13, color: PaperTheme.ink),
+              const SizedBox(width: 3),
+              Text(label,
+                  style: const TextStyle(
+                      color: PaperTheme.ink, fontSize: 11)),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   Widget _sigilButton(String label, String hint, VoidCallback onTap) {
@@ -226,94 +715,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                 style: const TextStyle(
                     color: PaperTheme.inkSoft, fontSize: 10.5)),
           ],
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      color: PaperTheme.paper,
-      padding: const EdgeInsets.all(24),
-      child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 760),
-          child: Container(
-            padding: const EdgeInsets.symmetric(
-                horizontal: 28, vertical: 18),
-            decoration: BoxDecoration(
-              // Subtle paper card over the paper background.
-              color: const Color(0xFFEFE8D6),
-              border:
-                  Border.all(color: PaperTheme.lineThin, width: 1),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Row(
-                  children: [
-                    _sigilButton(
-                        '@', 'children', () => _onSigilButton('@')),
-                    const SizedBox(width: 8),
-                    _sigilButton(
-                        '#', 'parents', () => _onSigilButton('#')),
-                    const Spacer(),
-                    const Text(
-                      'finish the word — its map slides up',
-                      style: TextStyle(
-                          color: PaperTheme.inkSoft, fontSize: 10.5),
-                    ),
-                  ],
-                ),
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 10),
-                  child: Divider(
-                      height: 1, color: PaperTheme.lineThin),
-                ),
-                if (!_loaded)
-                  const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(32),
-                      child: SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(
-                            strokeWidth: 2),
-                      ),
-                    ),
-                  )
-                else
-                  TextField(
-                    controller: _controller,
-                    focusNode: _focusNode,
-                    autofocus: true,
-                    maxLines: null,
-                    minLines: 18,
-                    expands: false,
-                    keyboardType: TextInputType.multiline,
-                    onChanged: (_) => _onTextChanged(),
-                    onTap: _updateLookup,
-                    style: const TextStyle(
-                      color: PaperTheme.ink,
-                      fontSize: 16,
-                      height: 1.6,
-                      fontFamily: 'Georgia',
-                    ),
-                    cursorColor: PaperTheme.ink,
-                    decoration: const InputDecoration(
-                      hintText:
-                          'Write freely…\n\nType @eat and the map of eat slides up — pick a word and copy it.',
-                      hintStyle: TextStyle(
-                          color: PaperTheme.inkSoft, fontSize: 14),
-                      border: InputBorder.none,
-                    ),
-                  ),
-              ],
-            ),
-          ),
         ),
       ),
     );
