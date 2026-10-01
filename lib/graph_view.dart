@@ -688,6 +688,70 @@ class GraphViewState extends State<GraphView> {
     return Color(c);
   }
 
+  Future<void> _editMeaning() async {
+    final sel = _selected;
+    final node = sel == null ? null : widget.graph.get(sel);
+    if (node == null) return;
+    _nameCtrl.text = node.meaning ?? '';
+    final field = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(12),
+      borderSide: const BorderSide(color: PaperTheme.lineThin),
+    );
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF4EEDF),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16)),
+        title: Text('Meaning of "${node.name}"',
+            style: const TextStyle(
+                color: PaperTheme.ink,
+                fontSize: 16,
+                fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 320,
+          child: TextField(
+            controller: _nameCtrl,
+            autofocus: true,
+            maxLines: 4,
+            minLines: 2,
+            style:
+                const TextStyle(color: PaperTheme.ink, fontSize: 14),
+            decoration: InputDecoration(
+              hintText: 'What does it mean…',
+              hintStyle: const TextStyle(
+                  color: PaperTheme.inkSoft, fontSize: 13),
+              filled: true,
+              fillColor: PaperTheme.surface,
+              border: field,
+              enabledBorder: field,
+              focusedBorder: field,
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel',
+                style: TextStyle(color: PaperTheme.inkSoft)),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(ctx).pop(_nameCtrl.text.trim()),
+            child: const Text('Save',
+                style: TextStyle(
+                    color: PaperTheme.ink,
+                    fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (saved == null || !mounted) return;
+    node.meaning = saved.isEmpty ? null : saved;
+    setState(() {});
+    await _persist();
+  }
+
   Future<void> _renameSelected() async {
     final sel = _selected;
     if (sel == null) return;
@@ -1006,11 +1070,16 @@ class GraphViewState extends State<GraphView> {
                           bottom: BorderSide(
                               color: PaperTheme.lineThin)),
                     ),
-                    child: Wrap(
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      spacing: 8,
-                      runSpacing: 8,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
                       children: [
+                        Wrap(
+                          crossAxisAlignment:
+                              WrapCrossAlignment.center,
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
                         Container(
                           padding: const EdgeInsets.symmetric(
                               horizontal: 14, vertical: 7),
@@ -1077,7 +1146,14 @@ class GraphViewState extends State<GraphView> {
                         ),
                       ],
                     ),
-                  ),
+                    const SizedBox(height: 6),
+                    _MeaningBlock(
+                      meaning: sel.meaning,
+                      onEdit: _editMeaning,
+                    ),
+                  ],
+                ),
+              ),
                 // Canvas with every word on it.
                 Expanded(
                   child: laid.placed.isEmpty
@@ -1391,6 +1467,68 @@ class GraphViewState extends State<GraphView> {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// Meaning line in the inspector: hidden on the canvas, shown here.
+/// Tap to view the full text or to add one when missing.
+class _MeaningBlock extends StatelessWidget {
+  final String? meaning;
+  final VoidCallback onEdit;
+  const _MeaningBlock({required this.meaning, required this.onEdit});
+
+  @override
+  Widget build(BuildContext context) {
+    final has = meaning != null && meaning!.trim().isNotEmpty;
+    return InkWell(
+      onTap: onEdit,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding:
+            const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 2, right: 6),
+              child: Icon(Icons.menu_book_outlined,
+                  size: 14, color: PaperTheme.inkSoft),
+            ),
+            Expanded(
+              child: has
+                  ? ConstrainedBox(
+                      constraints:
+                          const BoxConstraints(maxHeight: 96),
+                      child: SingleChildScrollView(
+                        child: Text(
+                          meaning!,
+                          style: const TextStyle(
+                            color: PaperTheme.ink,
+                            fontSize: 12.5,
+                            fontStyle: FontStyle.italic,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    )
+                  : const Text(
+                      'Add a meaning…',
+                      style: TextStyle(
+                        color: PaperTheme.inkSoft,
+                        fontSize: 12,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(left: 6),
+              child: Icon(Icons.edit_outlined,
+                  size: 13, color: PaperTheme.inkSoft),
+            ),
+          ],
+        ),
       ),
     );
   }

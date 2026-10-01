@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 
+import 'forbidden_view.dart';
 import 'graph_model.dart';
 import 'graph_view.dart';
 import 'sheet_view.dart';
@@ -60,7 +61,7 @@ class WordGraphToolApp extends StatelessWidget {
   }
 }
 
-/// Two views: Sheet (free writing) and Graph (settings / word network).
+/// Three views: Sheet (writing), Graph (word network), Banned (forbidden).
 class HomeShell extends StatefulWidget {
   const HomeShell({super.key});
 
@@ -72,6 +73,9 @@ class _HomeShellState extends State<HomeShell> {
   final StorageService _storage = StorageService();
   final WordGraph _graph = WordGraph();
   final GlobalKey<SheetViewState> _sheetKey = GlobalKey<SheetViewState>();
+
+  /// Forbidden words, shared live with the writing + banned views.
+  final List<String> _forbidden = [];
 
   int _tab = 0;
   bool _ready = false;
@@ -90,6 +94,10 @@ class _HomeShellState extends State<HomeShell> {
       final loaded = await _storage.loadGraph();
       _graph.nodes.clear();
       _graph.nodes.addAll(loaded.nodes);
+      final banned = await _storage.loadForbidden();
+      _forbidden
+        ..clear()
+        ..addAll(banned);
       // Seed a tiny example on first run so @ can be tried immediately.
       if (_graph.isEmpty) {
         _graph.connect('meal', 'eat');
@@ -149,6 +157,17 @@ class _HomeShellState extends State<HomeShell> {
                     fontWeight:
                         _tab == 1 ? FontWeight.w700 : FontWeight.normal)),
           ),
+          TextButton.icon(
+            onPressed: () => setState(() => _tab = 2),
+            icon: Icon(Icons.block,
+                color: _tab == 2 ? PaperTheme.ink : PaperTheme.inkSoft),
+            label: Text('Banned',
+                style: TextStyle(
+                    color:
+                        _tab == 2 ? PaperTheme.ink : PaperTheme.inkSoft,
+                    fontWeight:
+                        _tab == 2 ? FontWeight.w700 : FontWeight.normal)),
+          ),
           const SizedBox(width: 12),
         ],
       ),
@@ -169,12 +188,17 @@ class _HomeShellState extends State<HomeShell> {
                   key: _sheetKey,
                   storage: _storage,
                   graph: _graph,
+                  forbidden: _forbidden,
                   onGraphChanged: _onGraphChanged,
                 ),
                 GraphView(
                   storage: _storage,
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
+                ),
+                ForbiddenPage(
+                  storage: _storage,
+                  words: _forbidden,
                 ),
               ],
             ),

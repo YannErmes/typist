@@ -22,6 +22,7 @@ class StorageService {
   Directory? _wordsDir;
   Directory? _sheetsDir;
   File? _legacySheetFile;
+  File? _forbiddenFile;
 
   Directory? get baseDir => _base;
   String get basePath => _base?.path ?? '';
@@ -30,6 +31,7 @@ class StorageService {
   /// (e.g. running in a browser to preview the UI).
   final Map<String, Map<String, dynamic>> _memorySessions = {};
   String _memoryLegacy = '';
+  List<String> _memoryForbidden = [];
 
   /// True when running without a real folder (browser preview).
   bool get isMemoryOnly => _base == null;
@@ -50,12 +52,52 @@ class StorageService {
       await _sheetsDir!.create(recursive: true);
       _legacySheetFile = File(
           '${_base!.path}${Platform.pathSeparator}sheet.txt');
+      _forbiddenFile = File(
+          '${_base!.path}${Platform.pathSeparator}forbidden.txt');
     } catch (_) {
       // No documents folder (e.g. web preview): keep everything in memory.
       _base = null;
       _wordsDir = null;
       _sheetsDir = null;
       _legacySheetFile = null;
+      _forbiddenFile = null;
+    }
+  }
+
+  // ---- Forbidden words (one per line, auto-struck while writing) ----
+  static List<String> normalizeForbidden(Iterable<String> words) {
+    final seen = <String>{};
+    for (final w in words) {
+      final k = w.trim().toLowerCase();
+      if (k.isNotEmpty) seen.add(k);
+    }
+    final list = seen.toList()..sort();
+    return list;
+  }
+
+  Future<List<String>> loadForbidden() async {
+    if (_forbiddenFile == null) {
+      return normalizeForbidden(_memoryForbidden);
+    }
+    try {
+      if (!await _forbiddenFile!.exists()) return [];
+      final lines = await _forbiddenFile!.readAsLines();
+      return normalizeForbidden(lines);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> saveForbidden(List<String> words) async {
+    final clean = normalizeForbidden(words);
+    if (_forbiddenFile == null) {
+      _memoryForbidden = clean;
+      return;
+    }
+    try {
+      await _forbiddenFile!.writeAsString('${clean.join('\n')}\n');
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
     }
   }
 
@@ -280,8 +322,18 @@ class StorageService {
     if (node.color != null) {
       buf.writeln('color: ${node.color}');
     }
+    final meaning = node.meaning?.trim();
+    if (meaning != null && meaning.isNotEmpty) {
+      buf.writeln('## meaning');
+      buf.writeln(meaning);
+    }
     return buf.toString();
   }
+
+  static final _meaningHeader =
+      RegExp(r'^#{2,}\s*meaning\s*$', caseSensitive: false);
+  static final _knownKey =
+      RegExp(r'^(links|parents|children|x|y|color)\s*:', caseSensitive: false);
 
   static WordNode? parseWordFile(String content) {
     String? title;
@@ -289,10 +341,28 @@ class StorageService {
     double? x;
     double? y;
     int? color;
+    final meaningBuf = StringBuffer();
+    var inMeaning = false;
     for (final rawLine in content.split('\n')) {
-      final line = rawLine.trim();
-      if (line.startsWith('#')) {
-        title = line.replaceFirst(RegExp(r'^#+\s*'), '').trim().toLowerCase();
+      final line = rawLine.trimRight();
+      final low = line.trimLeft().toLowerCase();
+      if (_meaningHeader.hasMatch(line.trim())) {
+        inMeaning = true;
+        continue;
+      }
+      if (inMeaning &&
+          (_knownKey.hasMatch(low) || low.startsWith('#'))) {
+        inMeaning = false;
+      }
+      if (inMeaning) {
+        if (meaningBuf.isNotEmpty) meaningBuf.writeln();
+        meaningBuf.write(line.trim());
+        continue;
+      }
+      final t = line.trim();
+      if (t.startsWith('#')) {
+        // Only the first header is the word itself.
+        title ??= t.replaceFirst(RegExp(r'^#+\s*'), '').trim().toLowerCase();
       } else if (line.toLowerCase().startsWith('links:')) {
         links = _parseList(line.substring('links:'.length));
       } else if (line.toLowerCase().startsWith('parents:') ||
@@ -313,8 +383,13 @@ class StorageService {
     }
     if (title == null || title.isEmpty) return null;
     links.remove(title);
+    final meaning = meaningBuf.toString().trim();
     return WordNode(title,
-        links: links, x: x, y: y, color: color);
+        links: links,
+        x: x,
+        y: y,
+        color: color,
+        meaning: meaning.isEmpty ? null : meaning);
   }
 
   static Set<String> _parseList(String s) {

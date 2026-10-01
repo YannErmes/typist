@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:flutter_quill/flutter_quill.dart'
     show
+        Attribute,
         BackgroundAttribute,
         Document,
         IconButtonData,
@@ -14,6 +15,7 @@ import 'package:flutter_quill/flutter_quill.dart'
         QuillIconTheme,
         QuillSimpleToolbar,
         QuillSimpleToolbarConfig,
+        StrikeThroughAttribute,
         StyleAttribute,
         getEmbedNode;
 import 'package:flutter_quill_extensions/flutter_quill_extensions.dart';
@@ -23,21 +25,49 @@ import 'storage.dart';
 import 'tag_sheet.dart';
 import 'theme.dart';
 
-/// Fill marking words that exist on the mind-map (stored lowercase).
-const String _matchRedHex = '#f69697';
+/// Fill for graph words with no chosen card color (a touch deeper
+/// than paper so it stays visible).
+const String _matchDefaultHex = '#d9cfb0';
 
-/// Whole-word, case-insensitive ranges of [words] inside [text].
-/// Longest words first so ties prefer the fullest match.
-List<(int, int)> findGraphMatches(String text, List<String> words) {
-  final result = <(int, int)>[];
+/// Old managed fills from earlier versions; still lifted when stale.
+const Set<String> _legacyMatchHex = {'#c6efce', '#f69697'};
+
+String _colorHex(int argb) =>
+    '#${(argb & 0xFFFFFF).toRadixString(16).padLeft(6, '0')}';
+
+/// A graph word's highlight: its card color, or the default fill.
+String _highlightHexFor(WordGraph graph, String word) {
+  final c = graph.get(word)?.color;
+  if (c == null) return _matchDefaultHex;
+  return _colorHex(c);
+}
+
+/// All fills this pass manages (current cards + legacy leftovers).
+Set<String> _managedHexes(WordGraph graph) {
+  final out = <String>{_matchDefaultHex, ..._legacyMatchHex};
+  for (final n in graph.nodes.values) {
+    if (n.color != null) out.add(_colorHex(n.color!));
+  }
+  return out;
+}
+
+/// Whole-word, case-insensitive matches with the graph word each hit.
+List<({int start, int end, String word})> findGraphMatches(
+    String text, List<String> words) {
+  final result = <({int start, int end, String word})>[];
   final keys = words.where((w) => w.trim().isNotEmpty).toList();
   if (keys.isEmpty || text.isEmpty) return result;
-  final escaped = keys.map(RegExp.escape).toList()
+  final lower = <String, String>{};
+  for (final k in keys) {
+    lower.putIfAbsent(k.toLowerCase(), () => k);
+  }
+  final escaped = lower.keys.map(RegExp.escape).toList()
     ..sort((a, b) => b.length.compareTo(a.length));
   final re =
       RegExp('\\b(?:${escaped.join('|')})\\b', caseSensitive: false);
   for (final m in re.allMatches(text)) {
-    result.add((m.start, m.end));
+    result.add(
+        (start: m.start, end: m.end, word: lower[m.group(0)!.toLowerCase()]!));
   }
   return result;
 }
@@ -49,12 +79,16 @@ List<(int, int)> findGraphMatches(String text, List<String> words) {
 class SheetView extends StatefulWidget {
   final StorageService storage;
   final WordGraph graph;
+
+  /// Forbidden words, shared live with the banned page.
+  final List<String> forbidden;
   final VoidCallback onGraphChanged;
 
   const SheetView({
     super.key,
     required this.storage,
     required this.graph,
+    required this.forbidden,
     required this.onGraphChanged,
   });
 
@@ -202,15 +236,29 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _highlighter.call(_applyHighlight);
   }
 
-  /// Paint every graph word red; lift red that no longer matches.
-  /// Only touches our own red — the user's other colors are left alone.
+  /// Paint every graph word in its card color and cross every forbidden
+  /// word; lift marks that no longer match. Only touches managed fills —
+  /// the user's other colors are left alone (the strike tool stays off
+  /// the toolbar so every strike in the text is auto-managed).
   void _applyHighlight() {
     if (!mounted || _switching || !_loaded || _applyingHighlight) return;
     _applyingHighlight = true;
     try {
-      final ranges = findGraphMatches(
-          _quill.document.toPlainText(), widget.graph.sortedKeys());
-      final current = _currentGreenRanges();
+      final text = _quill.document.toPlainText();
+      final matches =
+          findGraphMatches(text, widget.graph.sortedKeys());
+      final greenRanges = [
+        for (final m in matches)
+          (
+            start: m.start,
+            end: m.end,
+            hex: _highlightHexFor(widget.graph, m.word),
+          )
+      ];
+      final strikeRanges = findGraphMatches(text, widget.forbidden)
+          .map((m) => (m.start, m.end))
+          .toList();
+      final current = _currentMarks(_managedHexes(widget.graph));
       bool covers(List<(int, int)> list, int s, int e) {
         for (final r in list) {
           if (r.$1 <= s && r.$2 >= e) return true;
@@ -218,16 +266,39 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         return false;
       }
 
-      for (final r in current) {
-        if (!covers(ranges, r.$1, r.$2)) {
+      bool coveredSameColor(
+          List<({int start, int end, String hex})> list,
+          int s,
+          int e,
+          String hex) {
+        for (final r in list) {
+          if (r.start <= s && r.end >= e && r.hex == hex) return true;
+        }
+        return false;
+      }
+
+      for (final r in current.green) {
+        if (!coveredSameColor(greenRanges, r.start, r.end, r.hex)) {
           _quill.formatText(
-              r.$1, r.$2 - r.$1, const BackgroundAttribute(null));
+              r.start, r.end - r.start, const BackgroundAttribute(null));
         }
       }
-      for (final r in ranges) {
-        if (!covers(current, r.$1, r.$2)) {
+      for (final n in greenRanges) {
+        if (!coveredSameColor(current.green, n.start, n.end, n.hex)) {
           _quill.formatText(
-              r.$1, r.$2 - r.$1, const BackgroundAttribute(_matchRedHex));
+              n.start, n.end - n.start, BackgroundAttribute(n.hex));
+        }
+      }
+      for (final r in current.strike) {
+        if (!covers(strikeRanges, r.$1, r.$2)) {
+          _quill.formatText(r.$1, r.$2 - r.$1,
+              Attribute.clone(Attribute.strikeThrough, null));
+        }
+      }
+      for (final r in strikeRanges) {
+        if (!covers(current.strike, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const StrikeThroughAttribute());
         }
       }
     } catch (_) {
@@ -236,10 +307,11 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       _applyingHighlight = false;
     }
   }
-
-  /// Live ranges currently wearing our red.
-  List<(int, int)> _currentGreenRanges() {
-    final out = <(int, int)>[];
+  /// Live ranges currently wearing a managed fill / a strike.
+  ({List<({int start, int end, String hex})> green, List<(int, int)> strike})
+      _currentMarks(Set<String> managed) {
+    final green = <({int start, int end, String hex})>[];
+    final strike = <(int, int)>[];
     var pos = 0;
     try {
       for (final op in _quill.document.toDelta().toList()) {
@@ -248,13 +320,17 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         final attrs = op.attributes;
         final bg = attrs == null ? null : attrs['background'];
         if (bg != null &&
-            bg.toString().toLowerCase() == _matchRedHex) {
-          out.add((pos, pos + len));
+            managed.contains(bg.toString().toLowerCase())) {
+          green.add(
+              (start: pos, end: pos + len, hex: bg.toString().toLowerCase()));
+        }
+        if (attrs != null && attrs['strike'] == true) {
+          strike.add((pos, pos + len));
         }
         pos += len;
       }
     } catch (_) {}
-    return out;
+    return (green: green, strike: strike);
   }
 
   /// True when the caret sits right on an image embed.

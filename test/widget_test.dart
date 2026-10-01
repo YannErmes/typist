@@ -28,14 +28,16 @@ void main() {
     const words = ['eat', 'meal', 'orange'];
     final hits = findGraphMatches(
         'I eat an EATERY with meal and ORANGE.', words);
-    final texts = [
-      for (final h in hits)
-        'I eat an EATERY with meal and ORANGE.'.substring(h.$1, h.$2)
-    ];
-    expect(texts, ['eat', 'meal', 'ORANGE']);
+    expect(
+        hits.map((h) => (h.start, h.end, h.word)).toList(),
+        [(0 + 2, 0 + 5, 'eat'), (21, 25, 'meal'), (30, 36, 'ORANGE'.toLowerCase())]);
     expect(findGraphMatches('nothing here', words), isEmpty);
     expect(findGraphMatches('', words), isEmpty);
-    expect(findGraphMatches('eat eat', words), [(0, 3), (4, 7)]);
+    expect(
+        findGraphMatches('eat eat', words)
+            .map((h) => (h.start, h.end))
+            .toList(),
+        [(0, 3), (4, 7)]);
   });
 
   test('graph renames keeping links, position and color', () {
@@ -54,6 +56,18 @@ void main() {
     expect(g.rename('dine', 'orange'), isFalse); // taken
   });
 
+  test('word file round-trips multi-line meaning', () {
+    final node = WordNode('eat', meaning: 'A sweet fruit.\nGrows on trees.');
+    final back =
+        StorageService.parseWordFile(StorageService.serializeWordFile(node));
+    expect(back, isNotNull);
+    expect(back!.meaning, 'A sweet fruit.\nGrows on trees.');
+    final plain =
+        StorageService.parseWordFile('# eat\nlinks: orange\n');
+    expect(plain, isNotNull);
+    expect(plain!.meaning, isNull);
+  });
+
   test('word file round-trips links, position and color', () {
     final node = WordNode('eat',
         links: {'meal', 'orange'}, x: 123.4, y: 567.8, color: 4278190080);
@@ -64,6 +78,13 @@ void main() {
     expect(back.x, closeTo(123.4, 0.01));
     expect(back.y, closeTo(567.8, 0.01));
     expect(back.color, 4278190080);
+  });
+
+  test('forbidden words save normalized and reload', () async {
+    final s = StorageService();
+    await s.init(); // falls back to in-memory when no folder exists
+    await s.saveForbidden(['  Darn ', 'darn', '', 'heck']);
+    expect(await s.loadForbidden(), ['darn', 'heck']);
   });
 
   test('legacy hierarchy files merge into plain links', () {
@@ -114,7 +135,7 @@ void main() {
     expect(find.byType(TagGraphSheet), findsNothing);
   });
 
-  testWidgets('graph words turn green while writing',
+  testWidgets('graph words glow their card color while writing',
       (WidgetTester tester) async {
     await tester.pumpWidget(const WordGraphToolApp());
     for (var i = 0;
@@ -124,15 +145,46 @@ void main() {
     }
     final sheetState =
         tester.state<SheetViewState>(find.byType(SheetView));
+    // No card color yet: neutral default fill.
     sheetState.typeForTest('I love orange juice');
     await tester.pump(const Duration(milliseconds: 800));
     await tester.pump(const Duration(milliseconds: 800));
-    expect(sheetState.debugDeltaJson(), contains('f69697'));
-    // Editing it away lifts the green again.
-    sheetState.typeForTest(' and more');
+    expect(sheetState.debugDeltaJson(), contains('d9cfb0'));
+    // Give orange a card color: the text follows it.
+    sheetState.widget.graph.get('orange')!.color = 0xFFE8A0A0;
+    sheetState.refreshGraph();
     await tester.pump(const Duration(milliseconds: 800));
     await tester.pump(const Duration(milliseconds: 800));
-    expect(sheetState.debugDeltaJson(), contains('f69697'));
+    expect(sheetState.debugDeltaJson(), contains('e8a0a0'));
+  });
+
+  testWidgets('forbidden words get struck through while writing',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    // Ban a word, then use it while writing.
+    await tester.tap(find.text('Banned'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.enterText(
+        find.byKey(const ValueKey('forbidden-add')), 'darn');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Add'));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('darn'), findsWidgets);
+    await tester.tap(find.text('Sheet'));
+    await tester.pump(const Duration(milliseconds: 500));
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .typeForTest('oh darn it');
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    final sheetState =
+        tester.state<SheetViewState>(find.byType(SheetView));
+    expect(sheetState.debugDeltaJson(), contains('"strike":true'));
   });
 
   testWidgets('tapping a link selects it and the chip deletes it',
@@ -249,7 +301,8 @@ void main() {
     await tester.tap(find.text('eat').first);
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(const Duration(milliseconds: 500));
-    expect(find.byIcon(Icons.edit_outlined), findsOneWidget);
+    // Inspector open for the picked word (rename + meaning edit icons).
+    expect(find.byIcon(Icons.edit_outlined), findsWidgets);
   });
 
   testWidgets('app boots to sheet view', (WidgetTester tester) async {

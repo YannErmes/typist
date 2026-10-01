@@ -11,8 +11,11 @@ class WordNode {
   /// Saved card color as ARGB int. Null = default paper.
   int? color;
 
+  /// Hidden definition shown when editing the word. Null/empty = none yet.
+  String? meaning;
+
   WordNode(this.name,
-      {Set<String>? links, this.x, this.y, this.color})
+      {Set<String>? links, this.x, this.y, this.color, this.meaning})
       : links = links ?? <String>{};
 
   bool get hasPos => x != null && y != null;
