@@ -7,6 +7,7 @@ import 'package:flutter_quill/flutter_quill.dart'
     show
         Attribute,
         BackgroundAttribute,
+        ColorAttribute,
         Document,
         IconButtonData,
         QuillController,
@@ -29,6 +30,9 @@ import 'theme.dart';
 /// than paper so it stays visible).
 const String _matchDefaultHex = '#d9cfb0';
 
+/// Banned words wear this red text with their cross-out line.
+const String _banRedHex = '#b3261e';
+
 /// Old managed fills from earlier versions; still lifted when stale.
 const Set<String> _legacyMatchHex = {'#c6efce', '#f69697'};
 
@@ -50,7 +54,6 @@ Set<String> _managedHexes(WordGraph graph) {
   }
   return out;
 }
-
 /// Whole-word, case-insensitive matches with the graph word each hit.
 List<({int start, int end, String word})> findGraphMatches(
     String text, List<String> words) {
@@ -70,6 +73,13 @@ List<({int start, int end, String word})> findGraphMatches(
         (start: m.start, end: m.end, word: lower[m.group(0)!.toLowerCase()]!));
   }
   return result;
+}
+
+/// Words typed: letter/digit runs, keeping mid-word apostrophes together.
+int countWords(String text) {
+  return RegExp(r"[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?", unicode: true)
+      .allMatches(text)
+      .length;
 }
 
 /// Writing view: titled sessions in a left rail, a styled editor
@@ -101,6 +111,11 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   late final FocusNode _focusNode;
   late final ScrollController _scrollCtrl;
   final TextEditingController _titleCtrl = TextEditingController();
+
+  /// Reused for every folder dialog. Never disposed mid-flight: disposing a
+  /// dialog controller while its route animates out trips rebuilds that
+  /// still reference it (red screen). Disposed once with this state.
+  final TextEditingController _folderCtrl = TextEditingController();
   final Debouncer _saver = Debouncer(const Duration(milliseconds: 500));
   final Debouncer _highlighter = Debouncer(const Duration(milliseconds: 600));
   bool _applyingHighlight = false;
@@ -111,12 +126,26 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   bool _switching = false; // guards programmatic controller updates
   bool _onImage = false; // caret sits on an image embed
 
-  // Mention popup state (@frag -> matching words).
+  /// Explicitly created folders (so empties survive restarts too).
+  final Set<String> _knownFolders = {};
+
+  /// Collapsed folders in the rail (everything expanded by default).
+  final Set<String> _collapsedFolders = {};
+
+  /// Live word count of the open note.
+  final ValueNotifier<int> _wordCount = ValueNotifier(0);
+
+  /// Already-handled #[phrase] tags this run, so retyping never fires twice.
+  final Set<String> _handledPhrase = {};
+
+  // Mention popup state (@frag -> matching words, #frag -> chooser).
   final LayerLink _layerLink = LayerLink();
   final GlobalKey _editorKey = GlobalKey();
   OverlayEntry? _overlay;
+  String _popupKind = 'mention'; // 'mention' or 'hash'
   List<String> _matches = [];
   String _frag = '';
+  String _hashFrag = '';
   Offset _popupOffset = const Offset(0, 40);
   double _editorWidth = 600;
 
@@ -134,6 +163,8 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
 
   Future<void> _boot() async {
     var sessions = await widget.storage.loadSessions();
+    final storedFolders = await widget.storage.loadFolders();
+    _knownFolders.addAll(storedFolders);
     // One-time upgrade: fold the old single sheet.txt into a session.
     final legacy = await widget.storage.takeLegacySheet();
     if (legacy != null) {
@@ -178,17 +209,217 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     } finally {
       _switching = false;
     }
+    _markExistingHashes();
+    _wordCount.value =
+        countWords(_quill.document.toPlainText());
+    _highlighter.call(_applyHighlight);
   }
 
   Future<void> _newSession() async {
     await _saveNow();
+    final folder = _activeFolder();
     final created = await widget.storage.createSession(
-        'Untitled ${_sessions.length + 1}');
+        'Untitled ${_sessions.length + 1}',
+        folder: folder);
     if (!mounted) return;
     setState(() {
       _sessions = [created, ..._sessions];
+      _collapsedFolders.remove(folder);
     });
     await _openSession(created.id);
+  }
+
+  List<String> _folderNames() {
+    final set = <String>{'Notes', ..._knownFolders};
+    for (final s in _sessions) {
+      set.add(s.folder);
+    }
+    final list = set.toList();
+    list.sort((a, b) {
+      if (a == 'Notes') return -1;
+      if (b == 'Notes') return 1;
+      return a.compareTo(b);
+    });
+    return list;
+  }
+
+  List<WritingSession> _sessionsIn(String folder) {
+    final list =
+        _sessions.where((s) => s.folder == folder).toList();
+    list.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    return list;
+  }
+
+  Future<void> _moveSession(WritingSession s, String folder) async {
+    s.folder = StorageService.normalizeFolder(folder);
+    setState(() => _collapsedFolders.remove(s.folder));
+    await widget.storage.saveSession(
+        s.id, s.title, await _deltaJsonFor(s.id),
+        folder: s.folder);
+  }
+
+  /// Current saved delta for a session (live doc if it is open).
+  Future<String> _deltaJsonFor(String id) async {
+    if (id == _activeId) return _deltaJson();
+    return await widget.storage.loadSessionDelta(id) ?? '';
+  }
+
+  Future<void> _moveDialog(WritingSession s) async {
+    final folders = _folderNames();
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF4EEDF),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16)),
+        title: Text('Move "${s.title}" to…',
+            style: const TextStyle(
+                color: PaperTheme.ink,
+                fontSize: 15,
+                fontWeight: FontWeight.w600)),
+        content: SizedBox(
+          width: 260,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final f in folders)
+                ListTile(
+                  dense: true,
+                  title: Text(f,
+                      style:
+                          const TextStyle(color: PaperTheme.ink)),
+                  trailing: f == s.folder
+                      ? const Icon(Icons.check,
+                          size: 16, color: PaperTheme.ink)
+                      : null,
+                  onTap: () => Navigator.of(ctx).pop(f),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel',
+                style: TextStyle(color: PaperTheme.inkSoft)),
+          ),
+        ],
+      ),
+    );
+    if (picked == null || !mounted) return;
+    await _moveSession(s, picked);
+  }
+
+  Future<void> _newFolder() async {
+    final name = await _askFolderName(title: 'New folder');
+    if (name == null || !mounted) return;
+    if (_folderNames()
+        .any((f) => f.toLowerCase() == name.toLowerCase())) {
+      _notice('A folder called "$name" already exists.');
+      return;
+    }
+    setState(() {
+      _knownFolders.add(name);
+      _collapsedFolders.remove(name);
+    });
+    await widget.storage.saveFolders(_knownFolders.toList());
+    _notice('Folder "$name" created.');
+  }
+
+  Future<void> _renameFolder(String oldName) async {
+    final name =
+        await _askFolderName(title: 'Rename "$oldName"', initial: oldName);
+    if (name == null || !mounted) return;
+    if (_folderNames().any((f) =>
+        f.toLowerCase() == name.toLowerCase() && f != oldName)) {
+      _notice('A folder called "$name" already exists.');
+      return;
+    }
+    for (final s in _sessions) {
+      if (s.folder == oldName) {
+        s.folder = name;
+        await widget.storage.saveSession(
+            s.id, s.title, await _deltaJsonFor(s.id),
+            folder: name);
+      }
+    }
+    _knownFolders.remove(oldName);
+    _knownFolders.add(name);
+    await widget.storage.saveFolders(_knownFolders.toList());
+    setState(() {
+      _collapsedFolders.remove(oldName);
+    });
+  }
+
+  Future<void> _deleteFolder(String folder) async {
+    if (_sessionsIn(folder).isNotEmpty) {
+      _notice('Move its notes out first.');
+      return;
+    }
+    setState(() {
+      _knownFolders.remove(folder);
+      _collapsedFolders.remove(folder);
+    });
+    await widget.storage.saveFolders(_knownFolders.toList());
+    _notice('Folder "$folder" deleted.');
+  }
+
+  Future<String?> _askFolderName(
+      {required String title, String? initial}) async {
+    _folderCtrl.text = initial ?? '';
+    final field = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(12),
+      borderSide: const BorderSide(color: PaperTheme.lineThin),
+    );
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF4EEDF),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16)),
+        title: Text(title,
+            style: const TextStyle(
+                color: PaperTheme.ink,
+                fontSize: 16,
+                fontWeight: FontWeight.w600)),
+        content: TextField(
+          controller: _folderCtrl,
+          autofocus: true,
+          onSubmitted: (_) =>
+              Navigator.of(ctx).pop(_folderCtrl.text.trim()),
+          style:
+              const TextStyle(color: PaperTheme.ink, fontSize: 14),
+          decoration: InputDecoration(
+            hintText: 'e.g. Journal',
+            hintStyle: const TextStyle(
+                color: PaperTheme.inkSoft, fontSize: 13),
+            filled: true,
+            fillColor: PaperTheme.surface,
+            border: field,
+            enabledBorder: field,
+            focusedBorder: field,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel',
+                style: TextStyle(color: PaperTheme.inkSoft)),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(ctx).pop(_folderCtrl.text.trim()),
+            child: const Text('Save',
+                style: TextStyle(
+                    color: PaperTheme.ink,
+                    fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    // NOTE: _folderCtrl is intentionally NOT disposed here (see field docs).
+    if (name == null || name.trim().isEmpty) return null;
+    return name.trim();
   }
 
   Future<void> _deleteSession(String id) async {
@@ -217,11 +448,19 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     }
   }
 
+  String _activeFolder() {
+    for (final s in _sessions) {
+      if (s.id == _activeId) return s.folder;
+    }
+    return 'Notes';
+  }
+
   Future<void> _saveNow() async {
     final id = _activeId;
     if (id == null || !_loaded) return;
-    await widget.storage
-        .saveSession(id, _titleCtrl.text.trim(), _deltaJson());
+    await widget.storage.saveSession(
+        id, _titleCtrl.text.trim(), _deltaJson(),
+        folder: _activeFolder());
   }
 
   void _onDocChanged() {
@@ -229,11 +468,16 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     if (_applyingHighlight) return; // our own green paint, not typing
     final id = _activeId!;
     final title = _titleCtrl.text.trim();
-    _saver.call(() => widget.storage.saveSession(id, title, _deltaJson()));
+    final folder = _activeFolder();
+    _saver.call(() => widget.storage
+        .saveSession(id, title, _deltaJson(), folder: folder));
+    _wordCount.value =
+        countWords(_quill.document.toPlainText());
     final onImg = _caretOnImage();
     if (onImg != _onImage) setState(() => _onImage = onImg);
     _updateLookup();
     _highlighter.call(_applyHighlight);
+    _scanHashes();
   }
 
   /// Paint every graph word in its card color and cross every forbidden
@@ -295,10 +539,20 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
               Attribute.clone(Attribute.strikeThrough, null));
         }
       }
+      for (final r in current.red) {
+        if (!covers(strikeRanges, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const ColorAttribute(null));
+        }
+      }
       for (final r in strikeRanges) {
         if (!covers(current.strike, r.$1, r.$2)) {
           _quill.formatText(
               r.$1, r.$2 - r.$1, const StrikeThroughAttribute());
+        }
+        if (!covers(current.red, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const ColorAttribute(_banRedHex));
         }
       }
     } catch (_) {
@@ -307,11 +561,15 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       _applyingHighlight = false;
     }
   }
-  /// Live ranges currently wearing a managed fill / a strike.
-  ({List<({int start, int end, String hex})> green, List<(int, int)> strike})
-      _currentMarks(Set<String> managed) {
+  /// Live ranges currently wearing a managed fill / a strike / ban red.
+  ({
+    List<({int start, int end, String hex})> green,
+    List<(int, int)> strike,
+    List<(int, int)> red,
+  }) _currentMarks(Set<String> managed) {
     final green = <({int start, int end, String hex})>[];
     final strike = <(int, int)>[];
+    final red = <(int, int)>[];
     var pos = 0;
     try {
       for (final op in _quill.document.toDelta().toList()) {
@@ -327,10 +585,14 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         if (attrs != null && attrs['strike'] == true) {
           strike.add((pos, pos + len));
         }
+        final fg = attrs == null ? null : attrs['color'];
+        if (fg != null && fg.toString().toLowerCase() == _banRedHex) {
+          red.add((pos, pos + len));
+        }
         pos += len;
       }
     } catch (_) {}
-    return (green: green, strike: strike);
+    return (green: green, strike: strike, red: red);
   }
 
   /// True when the caret sits right on an image embed.
@@ -376,7 +638,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       }
     }
     final id = _activeId!;
-    _saver.call(() => widget.storage.saveSession(id, title, _deltaJson()));
+    final folder = _activeFolder();
+    _saver.call(() => widget.storage
+        .saveSession(id, title, _deltaJson(), folder: folder));
     setState(() {}); // refresh rail titles
   }
 
@@ -385,11 +649,13 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _saveNow();
     _saver.dispose();
     _highlighter.dispose();
+    _wordCount.dispose();
     _removeOverlay();
     WidgetsBinding.instance.removeObserver(this);
     _quill.removeListener(_onDocChanged);
     _quill.dispose();
     _titleCtrl.dispose();
+    _folderCtrl.dispose();
     _focusNode.dispose();
     _scrollCtrl.dispose();
     super.dispose();
@@ -424,6 +690,85 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   bool _isBoundary(String ch) =>
       ch == ' ' || ch == '\n' || ch == '\t' || ch == '(' || ch == '"';
 
+  // ---- Hash tags: #[phrase] bans a phrase on `]`; #word opens a
+  // chooser (ban it or put it on the map). Matches already handled this
+  // run are skipped so retyping never fires twice.
+  static final _phraseTagRe = RegExp(r'#\[([^\]\n]+)\]');
+
+  /// Returns the #fragment (possibly empty) or null when no # tag applies.
+  String? _detectHash() {
+    final text = _quill.document.toPlainText();
+    final sel = _quill.selection;
+    if (!sel.isValid || sel.baseOffset < 0) return null;
+    final cursor = sel.baseOffset.clamp(0, text.length);
+    int i = cursor - 1;
+    while (i >= 0 && _isWordChar(text[i])) {
+      i--;
+    }
+    if (i < 0 || text[i] != '#') return null;
+    if (i > 0 && !_isBoundary(text[i - 1])) return null;
+    return text.substring(i + 1, cursor).toLowerCase();
+  }
+
+  void _scanHashes() {
+    if (!_loaded || _switching) return;
+    String text;
+    try {
+      text = _quill.document.toPlainText();
+    } catch (_) {
+      return;
+    }
+    // #[a whole phrase here] -> banned as one phrase.
+    for (final m in _phraseTagRe.allMatches(text)) {
+      final full = m.group(0)!;
+      if (_handledPhrase.contains(full)) continue;
+      _handledPhrase.add(full);
+      final phrase = m.group(1)!.trim().toLowerCase();
+      if (phrase.isNotEmpty) _banWords([phrase], 'Banned "$phrase".');
+    }
+  }
+
+  /// Silently mark every #[phrase] already in the text (e.g. just opened
+  /// a note) so nothing fires until something new is typed.
+  void _markExistingHashes() {
+    String text;
+    try {
+      text = _quill.document.toPlainText();
+    } catch (_) {
+      return;
+    }
+    for (final m in _phraseTagRe.allMatches(text)) {
+      _handledPhrase.add(m.group(0)!);
+    }
+  }
+
+  void _banWords(List<String> words, String notice) {
+    var changed = false;
+    for (final w in words) {
+      final k = w.trim().toLowerCase();
+      if (k.isNotEmpty && !widget.forbidden.contains(k)) {
+        widget.forbidden.add(k);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    widget.forbidden.sort();
+    widget.storage.saveForbidden(widget.forbidden);
+    _highlighter.call(_applyHighlight);
+    _notice(notice);
+  }
+
+  void _notice(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
   void _updateLookup() {
     if (!_loaded || _activeId == null) return;
     // Never hijack an active text selection with the popup.
@@ -431,26 +776,43 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       _removeOverlay();
       return;
     }
-    final frag = _detectMention();
-    if (frag == null) {
+    // @word → mention list from the map.
+    final mention = _detectMention();
+    if (mention != null) {
+      final all = widget.graph.sortedKeys();
+      final starts = [
+        for (final k in all)
+          if (k.startsWith(mention)) k
+      ];
+      final contains = [
+        for (final k in all)
+          if (!k.startsWith(mention) && k.contains(mention)) k
+      ];
+      _popupKind = 'mention';
+      _hashFrag = '';
+      _frag = mention;
+      _matches = [...starts, ...contains];
+      if (_matches.isEmpty) {
+        _removeOverlay();
+        return;
+      }
+      _estimateCaretOffset();
+      if (_overlay == null) {
+        _showOverlay();
+      } else {
+        _overlay!.markNeedsBuild();
+      }
+      return;
+    }
+    // #word → chooser: ban it or put it on the map.
+    final hash = _detectHash();
+    if (hash == null) {
       _removeOverlay();
       return;
     }
-    final all = widget.graph.sortedKeys();
-    final starts = [
-      for (final k in all)
-        if (k.startsWith(frag)) k
-    ];
-    final contains = [
-      for (final k in all)
-        if (!k.startsWith(frag) && k.contains(frag)) k
-    ];
-    _frag = frag;
-    _matches = [...starts, ...contains];
-    if (_matches.isEmpty) {
-      _removeOverlay();
-      return;
-    }
+    _popupKind = 'hash';
+    _hashFrag = hash;
+    _matches = const [];
     _estimateCaretOffset();
     if (_overlay == null) {
       _showOverlay();
@@ -516,8 +878,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _overlay = null;
   }
 
-  /// Tiny floating mention list — fixed small size, never a big panel.
+  /// Tiny floating popup — mention list or # chooser by mode.
   Widget _buildPicker() {
+    if (_popupKind == 'hash') return _buildChooser();
     return Material(
       color: Colors.transparent,
       child: Container(
@@ -608,6 +971,136 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// #word chooser: ban the typed word or put it on the map.
+  Widget _buildChooser() {
+    final frag = _hashFrag;
+    final ready = frag.isNotEmpty;
+    final onMap = widget.graph.get(frag) != null;
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        width: 210,
+        decoration: BoxDecoration(
+          color: const Color(0xFFF4EEDF),
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF3E3A31).withValues(alpha: 0.14),
+              blurRadius: 14,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 6, 4),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      ready ? '"$frag" goes to…' : 'type a word…',
+                      style: const TextStyle(
+                        color: PaperTheme.inkSoft,
+                        fontSize: 11,
+                        fontStyle: FontStyle.italic,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  InkWell(
+                    onTap: _removeOverlay,
+                    borderRadius: BorderRadius.circular(12),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(Icons.close,
+                          size: 13, color: PaperTheme.inkSoft),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (ready) ...[
+              _chooserRow(
+                icon: Icons.block,
+                label: onMap ? '"$frag" is on the map' : 'Ban "$frag"',
+                enabled: !onMap,
+                onTap: () {
+                  _banWords([frag], 'Banned "$frag".');
+                  _removeOverlay();
+                },
+              ),
+              _chooserRow(
+                icon: Icons.account_tree_outlined,
+                label: onMap ? 'Open "$frag" on the map' : 'Map "$frag"',
+                enabled: true,
+                onTap: () {
+                  final isNew = widget.graph.get(frag) == null;
+                  widget.graph.ensure(frag);
+                  widget.storage.saveGraph(widget.graph);
+                  widget.onGraphChanged();
+                  if (isNew) _notice('"$frag" added to the map.');
+                  _removeOverlay();
+                  _openMapSheet(frag);
+                },
+              ),
+            ],
+            const Padding(
+              padding: EdgeInsets.fromLTRB(12, 3, 12, 8),
+              child: Text(
+                'choose where it goes',
+                style: TextStyle(
+                    color: PaperTheme.inkSoft, fontSize: 9),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _chooserRow({
+    required IconData icon,
+    required String label,
+    required bool enabled,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: enabled ? onTap : null,
+      child: Opacity(
+        opacity: enabled ? 1 : 0.45,
+        child: Container(
+          margin:
+              const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+          padding:
+              const EdgeInsets.symmetric(horizontal: 9, vertical: 7),
+          decoration: BoxDecoration(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(9),
+          ),
+          child: Row(
+            children: [
+              Icon(icon, size: 14, color: PaperTheme.inkSoft),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  label,
+                  style: const TextStyle(
+                    color: PaperTheme.ink,
+                    fontSize: 12.5,
+                  ),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -751,6 +1244,15 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                               letterSpacing: 1.2)),
                       const Spacer(),
                       IconButton(
+                        tooltip: 'New folder',
+                        onPressed:
+                            _loaded ? _newFolder : null,
+                        icon: const Icon(
+                            Icons.create_new_folder_outlined,
+                            size: 17,
+                            color: PaperTheme.inkSoft),
+                      ),
+                      IconButton(
                         tooltip: 'New note',
                         onPressed: _loaded ? _newSession : null,
                         icon: const Icon(Icons.add,
@@ -767,74 +1269,46 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                               height: 20,
                               child: CircularProgressIndicator(
                                   strokeWidth: 2)))
-                      : ListView.builder(
-                          itemCount: _sessions.length,
-                          itemBuilder: (context, i) {
-                            final s = _sessions[i];
-                            final active = s.id == _activeId;
-                            return InkWell(
-                              onTap: () {
-                                if (s.id != _activeId) {
-                                  _openSession(s.id);
-                                }
-                              },
-                              borderRadius:
-                                  BorderRadius.circular(12),
-                              child: Container(
-                                margin: const EdgeInsets.symmetric(
-                                    horizontal: 8, vertical: 2),
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 10, vertical: 8),
-                                decoration: BoxDecoration(
-                                  color: active
-                                      ? PaperTheme.chip
-                                      : Colors.transparent,
-                                  borderRadius:
-                                      BorderRadius.circular(12),
-                                ),
-                                child: Row(
-                                  children: [
-                                    Expanded(
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Text(s.title,
-                                              overflow:
-                                                  TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                color: PaperTheme.ink,
-                                                fontSize: 13,
-                                                fontWeight: active
-                                                    ? FontWeight.w600
-                                                    : FontWeight.normal,
-                                              )),
-                                          Text(_dateLabel(s.updatedAt),
-                                              style: const TextStyle(
-                                                  color: PaperTheme
-                                                      .inkSoft,
-                                                  fontSize: 10)),
-                                        ],
-                                      ),
-                                    ),
-                                    InkWell(
-                                      onTap: () =>
+                      : ListView(
+                          children: [
+                            for (final folder in _folderNames())
+                              _FolderSection(
+                                folder: folder,
+                                collapsed: _collapsedFolders
+                                    .contains(folder),
+                                onToggle: () => setState(() {
+                                  if (!_collapsedFolders
+                                      .remove(folder)) {
+                                    _collapsedFolders.add(folder);
+                                  }
+                                }),
+                                onRename: folder == 'Notes'
+                                    ? null
+                                    : () => _renameFolder(folder),
+                                onDelete: folder == 'Notes'
+                                    ? null
+                                    : () => _deleteFolder(folder),
+                                children: [
+                                  for (final s
+                                      in _sessionsIn(folder))
+                                    _NoteRow(
+                                      title: s.title,
+                                      date: _dateLabel(
+                                          s.updatedAt),
+                                      active: s.id == _activeId,
+                                      onTap: () {
+                                        if (s.id != _activeId) {
+                                          _openSession(s.id);
+                                        }
+                                      },
+                                      onMove: () =>
+                                          _moveDialog(s),
+                                      onDelete: () =>
                                           _deleteSession(s.id),
-                                      borderRadius:
-                                          BorderRadius.circular(8),
-                                      child: const Padding(
-                                        padding: EdgeInsets.all(4),
-                                        child: Icon(Icons.close,
-                                            size: 13,
-                                            color:
-                                                PaperTheme.inkSoft),
-                                      ),
                                     ),
-                                  ],
-                                ),
+                                ],
                               ),
-                            );
-                          },
+                          ],
                         ),
                 ),
               ],
@@ -1008,6 +1482,21 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                   ),
                                 ),
                               ),
+                              Padding(
+                                padding: const EdgeInsets.only(top: 6),
+                                child: Align(
+                                  alignment: Alignment.centerRight,
+                                  child: ValueListenableBuilder<int>(
+                                    valueListenable: _wordCount,
+                                    builder: (context, n, _) => Text(
+                                      '$n ${n == 1 ? 'word' : 'words'}',
+                                      style: const TextStyle(
+                                          color: PaperTheme.inkSoft,
+                                          fontSize: 10.5),
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ],
                           ),
                   ),
@@ -1073,6 +1562,163 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
             Text(hint,
                 style: const TextStyle(
                     color: PaperTheme.inkSoft, fontSize: 10.5)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One folder section in the notes rail.
+class _FolderSection extends StatelessWidget {
+  final String folder;
+  final bool collapsed;
+  final VoidCallback onToggle;
+  final VoidCallback? onRename;
+  final VoidCallback? onDelete;
+  final List<Widget> children;
+
+  const _FolderSection({
+    required this.folder,
+    required this.collapsed,
+    required this.onToggle,
+    required this.onRename,
+    required this.onDelete,
+    required this.children,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        InkWell(
+          onTap: onToggle,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(10, 8, 4, 6),
+            child: Row(
+              children: [
+                Icon(
+                    collapsed
+                        ? Icons.chevron_right
+                        : Icons.expand_more,
+                    size: 16,
+                    color: PaperTheme.inkSoft),
+                Expanded(
+                  child: Text(
+                    '$folder (${children.length})',
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        color: PaperTheme.inkSoft,
+                        fontSize: 11,
+                        letterSpacing: 0.8,
+                        fontWeight: FontWeight.w600),
+                  ),
+                ),
+                if (onRename != null)
+                  InkWell(
+                    onTap: onRename,
+                    borderRadius: BorderRadius.circular(8),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(Icons.edit_outlined,
+                          size: 12, color: PaperTheme.inkSoft),
+                    ),
+                  ),
+                if (onDelete != null)
+                  InkWell(
+                    onTap: onDelete,
+                    borderRadius: BorderRadius.circular(8),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(Icons.delete_outline,
+                          size: 13, color: PaperTheme.inkSoft),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+        if (!collapsed) ...children,
+        const SizedBox(height: 4),
+      ],
+    );
+  }
+}
+
+/// One note row in the rail, with move + delete.
+class _NoteRow extends StatelessWidget {
+  final String title;
+  final String date;
+  final bool active;
+  final VoidCallback onTap;
+  final VoidCallback onMove;
+  final VoidCallback onDelete;
+
+  const _NoteRow({
+    required this.title,
+    required this.date,
+    required this.active,
+    required this.onTap,
+    required this.onMove,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        margin:
+            const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        padding:
+            const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        decoration: BoxDecoration(
+          color: active ? PaperTheme.chip : Colors.transparent,
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: PaperTheme.ink,
+                        fontSize: 13,
+                        fontWeight: active
+                            ? FontWeight.w600
+                            : FontWeight.normal,
+                      )),
+                  Text(date,
+                      style: const TextStyle(
+                          color: PaperTheme.inkSoft, fontSize: 10)),
+                ],
+              ),
+            ),
+            InkWell(
+              onTap: onMove,
+              borderRadius: BorderRadius.circular(8),
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.drive_file_move_outlined,
+                    size: 13, color: PaperTheme.inkSoft),
+              ),
+            ),
+            InkWell(
+              onTap: onDelete,
+              borderRadius: BorderRadius.circular(8),
+              child: const Padding(
+                padding: EdgeInsets.all(4),
+                child: Icon(Icons.close,
+                    size: 13, color: PaperTheme.inkSoft),
+              ),
+            ),
           ],
         ),
       ),

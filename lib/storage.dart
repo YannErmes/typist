@@ -10,8 +10,10 @@ import 'graph_model.dart';
 class WritingSession {
   final String id;
   String title;
+  String folder;
   int updatedAt;
-  WritingSession(this.id, this.title, this.updatedAt);
+  WritingSession(this.id, this.title, this.updatedAt,
+      {this.folder = 'Notes'});
 }
 
 /// All persistence is local files, written silently with dart:io.
@@ -101,12 +103,60 @@ class StorageService {
     }
   }
 
+  // ---- Explicit folders (so empty folders survive a restart) ----
+  List<String> _memoryFolders = [];
+
+  File? get _foldersFile => _base == null
+      ? null
+      : File(
+          '${_base!.path}${Platform.pathSeparator}folders.txt');
+
+  static List<String> normalizeFolders(Iterable<String> folders) {
+    final seen = <String>{};
+    for (final f in folders) {
+      final t = f.trim();
+      if (t.isNotEmpty) seen.add(t);
+    }
+    final list = seen.toList()..sort();
+    return list;
+  }
+
+  Future<List<String>> loadFolders() async {
+    final file = _foldersFile;
+    if (file == null) return List.of(_memoryFolders);
+    try {
+      if (!await file.exists()) return [];
+      return normalizeFolders(await file.readAsLines());
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> saveFolders(List<String> folders) async {
+    final clean = normalizeFolders(folders);
+    final file = _foldersFile;
+    if (file == null) {
+      _memoryFolders = clean;
+      return;
+    }
+    try {
+      await file.writeAsString('${clean.join('\n')}\n');
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
+  }
+
   // ---- Writing sessions ----
   String _sessionFile(String id) =>
       '${_sheetsDir!.path}${Platform.pathSeparator}$id.json';
 
   String _newId() =>
       '${DateTime.now().millisecondsSinceEpoch}-${_memorySessions.length}';
+
+  static String normalizeFolder(String? folder) {
+    final f = (folder ?? '').trim();
+    return f.isEmpty ? 'Notes' : f;
+  }
 
   /// Sessions, newest first.
   Future<List<WritingSession>> loadSessions() async {
@@ -117,7 +167,8 @@ class StorageService {
               (e.value['title'] as String?)?.trim().isEmpty ?? true
                   ? 'Untitled'
                   : (e.value['title'] as String),
-              (e.value['updatedAt'] as int?) ?? 0))
+              (e.value['updatedAt'] as int?) ?? 0,
+              folder: normalizeFolder(e.value['folder'] as String?)))
           .toList()
         ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
       return list;
@@ -132,9 +183,11 @@ class StorageService {
           final base = ent.path.split(Platform.pathSeparator).last;
           final id = base.substring(0, base.length - 5);
           final title = (raw['title'] as String?)?.trim();
-          out.add(WritingSession(id,
+          out.add(WritingSession(
+              id,
               title == null || title.isEmpty ? 'Untitled' : title,
-              (raw['updatedAt'] as int?) ?? 0));
+              (raw['updatedAt'] as int?) ?? 0,
+              folder: normalizeFolder(raw['folder'] as String?)));
         } catch (_) {
           continue;
         }
@@ -159,13 +212,16 @@ class StorageService {
     }
   }
 
-  Future<void> saveSession(String id, String title, String deltaJson) async {
+  Future<void> saveSession(String id, String title, String deltaJson,
+      {String folder = 'Notes'}) async {
     final now = DateTime.now().millisecondsSinceEpoch;
+    final cleanFolder = normalizeFolder(folder);
     if (_sheetsDir == null) {
       _memorySessions[id] = {
         'title': title,
         'updatedAt': now,
         'delta': deltaJson,
+        'folder': cleanFolder,
       };
       return;
     }
@@ -174,17 +230,19 @@ class StorageService {
         'title': title,
         'updatedAt': now,
         'delta': deltaJson,
+        'folder': cleanFolder,
       }));
     } catch (_) {
       // Silent: never interrupt typing for IO errors.
     }
   }
 
-  Future<WritingSession> createSession(String title) async {
+  Future<WritingSession> createSession(String title,
+      {String folder = 'Notes'}) async {
     final id = _newId();
-    await saveSession(id, title, '');
-    return WritingSession(
-        id, title, DateTime.now().millisecondsSinceEpoch);
+    await saveSession(id, title, '', folder: folder);
+    return WritingSession(id, title, DateTime.now().millisecondsSinceEpoch,
+        folder: normalizeFolder(folder));
   }
 
   Future<void> deleteSession(String id) async {

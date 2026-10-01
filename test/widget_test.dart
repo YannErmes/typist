@@ -6,7 +6,7 @@ import 'package:word_graph_tool/graph_model.dart';
 import 'package:word_graph_tool/graph_view.dart';
 import 'package:word_graph_tool/main.dart';
 import 'package:word_graph_tool/sheet_view.dart'
-    show SheetView, SheetViewState, findGraphMatches;
+    show SheetView, SheetViewState, countWords, findGraphMatches;
 import 'package:word_graph_tool/storage.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
 
@@ -94,6 +94,30 @@ void main() {
     expect(back!.links, {'meal', 'food', 'orange'});
   });
 
+  test('word counts ignore extra whitespace', () {
+    expect(countWords(''), 0);
+    expect(countWords('   \n '), 0);
+    expect(countWords('hello world'), 2);
+    expect(countWords('  one   two\nthree  '), 3);
+    expect(countWords("don't stop"), 2);
+  });
+
+  test('sessions round-trip their folder', () async {
+    final s = StorageService();
+    await s.init(); // falls back to in-memory when no folder exists
+    final a = await s.createSession('Alpha', folder: 'Work');
+    await s.saveSession(a.id, 'Alpha', '[]', folder: 'Work');
+    final list = await s.loadSessions();
+    final back = list.firstWhere((e) => e.id == a.id);
+    expect(back.folder, 'Work');
+    // Missing folder migrates to Notes.
+    final b = await s.createSession('Beta');
+    await s.saveSession(b.id, 'Beta', '[]');
+    expect(
+        (await s.loadSessions()).firstWhere((e) => e.id == b.id).folder,
+        'Notes');
+  });
+
   test('sessions save, list and reload content', () async {
     final s = StorageService();
     await s.init(); // falls back to in-memory when no folder exists
@@ -156,6 +180,98 @@ void main() {
     await tester.pump(const Duration(milliseconds: 800));
     await tester.pump(const Duration(milliseconds: 800));
     expect(sheetState.debugDeltaJson(), contains('e8a0a0'));
+  });
+
+  testWidgets('#word chooser bans or maps, #[phrase] bans',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    final sheetState =
+        tester.state<SheetViewState>(find.byType(SheetView));
+    // Typing #word offers both destinations; nothing auto-fires.
+    sheetState.typeForTest('this is #yuck');
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Ban "yuck"'), findsOneWidget);
+    expect(find.text('Map "yuck"'), findsOneWidget);
+    expect(sheetState.widget.forbidden, isNot(contains('yuck')));
+    expect(sheetState.widget.graph.get('yuck'), isNull);
+    // Choose ban.
+    await tester.tap(find.text('Ban "yuck"'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(sheetState.widget.forbidden, contains('yuck'));
+    expect(sheetState.debugDeltaJson(), contains('"strike":true'));
+    // Choose map for another word.
+    sheetState.typeForTest(' plus #pear');
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.tap(find.text('Map "pear"'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(sheetState.widget.graph.get('pear'), isNotNull);
+    expect(find.byType(TagGraphSheet), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.keyboard_arrow_down));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.byType(TagGraphSheet), findsNothing);
+    // #[phrase] still bans the whole phrase on ].
+    sheetState.typeForTest('#[very bad phrase] ');
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(
+        sheetState.widget.forbidden, contains('very bad phrase'));
+  });
+
+  testWidgets('word count follows the typed text',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .typeForTest('one two three');
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('3 words'), findsOneWidget);
+  });
+
+  testWidgets('folders group notes and accept moves',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    // New folder via dialog.
+    await tester.tap(find.byIcon(Icons.create_new_folder_outlined));
+    await tester.pump(const Duration(milliseconds: 500));
+    final folderField = find.descendant(
+      of: find.byType(AlertDialog),
+      matching: find.byType(TextField),
+    );
+    expect(folderField, findsOneWidget);
+    await tester.tap(folderField);
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.enterText(folderField, 'Work');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Save'));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Work (0)'), findsOneWidget);
+    // Move the open note into it.
+    await tester.tap(find.byIcon(Icons.drive_file_move_outlined).first);
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.tap(find.text('Work'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Work (1)'), findsOneWidget);
   });
 
   testWidgets('forbidden words get struck through while writing',
