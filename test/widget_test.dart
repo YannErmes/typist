@@ -436,6 +436,36 @@ void main() {
     expect(find.text('Work (1)'), findsOneWidget);
   });
 
+  testWidgets('fix-it sheet lists typos and Learn clears them',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    tester.state<SheetViewState>(find.byType(SheetView)).debugUseSpell(
+        SpellCheck.fromWordsList(['say', 'world', 'hello']));
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .typeForTest('say helo world');
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    // Orange flag + footer button appear.
+    expect(find.text('1 to fix'), findsOneWidget);
+    await tester.tap(find.text('1 to fix'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Possible typos — tap a fix'), findsOneWidget);
+    expect(find.text('helo'), findsWidgets);
+    await tester.tap(find.text('Learn'));
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    final sheetState =
+        tester.state<SheetViewState>(find.byType(SheetView));
+    expect(sheetState.debugDeltaJson(), isNot(contains('ffdfb0')));
+  });
+
   testWidgets('forbidden words get struck through while writing',
       (WidgetTester tester) async {
     await tester.pumpWidget(const WordGraphToolApp());

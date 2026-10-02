@@ -136,11 +136,42 @@ class StorageService {
     }
   }
   List<String> _memoryFolders = [];
+  List<String> _memoryLearned = [];
 
   File? get _foldersFile => _base == null
       ? null
       : File(
           '${_base!.path}${Platform.pathSeparator}folders.txt');
+
+  File? get _learnedFile => _base == null
+      ? null
+      : File(
+          '${_base!.path}${Platform.pathSeparator}learned.txt');
+
+  Future<List<String>> loadLearned() async {
+    final file = _learnedFile;
+    if (file == null) return List.of(_memoryLearned);
+    try {
+      if (!await file.exists()) return [];
+      return normalizeForbidden(await file.readAsLines());
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> saveLearned(List<String> words) async {
+    final clean = normalizeForbidden(words);
+    final file = _learnedFile;
+    if (file == null) {
+      _memoryLearned = clean;
+      return;
+    }
+    try {
+      await file.writeAsString('${clean.join('\n')}\n');
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
+  }
 
   static List<String> normalizeFolders(Iterable<String> folders) {
     final seen = <String>{};

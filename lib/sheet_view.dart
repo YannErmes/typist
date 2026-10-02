@@ -3,7 +3,11 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'
-    show Clipboard, ClipboardData, rootBundle;
+    show
+        Clipboard,
+        ClipboardData,
+        SelectionChangedCause,
+        rootBundle;
 import 'package:spell_check_on_client/spell_check_on_client.dart';
 import 'package:flutter_quill/flutter_quill.dart'
     show
@@ -16,6 +20,7 @@ import 'package:flutter_quill/flutter_quill.dart'
         QuillEditor,
         QuillEditorConfig,
         QuillIconTheme,
+        QuillRawEditorState,
         QuillSimpleToolbar,
         QuillSimpleToolbarConfig,
         StrikeThroughAttribute,
@@ -78,9 +83,16 @@ List<({int start, int end, String word})> findGraphMatches(
   return result;
 }
 
+bool _listEquals(List<String> a, List<String> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
 /// Words typed: letter/digit runs, keeping mid-word apostrophes together.
-int countWords(String text) {
-  return RegExp(r"[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?", unicode: true)
+int countWords(String text) {  return RegExp(r"[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?", unicode: true)
       .allMatches(text)
       .length;
 }
@@ -166,8 +178,14 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   /// Offline spell checker (null until the dictionary asset loads).
   SpellCheck? _spell;
 
+  /// Words the user taught the checker via Learn spelling.
+  final Set<String> _learned = {};
+
   /// Live word count of the open note.
   final ValueNotifier<int> _wordCount = ValueNotifier(0);
+
+  /// Distinct flagged words in the open note (for the fix-it sheet).
+  final ValueNotifier<List<String>> _spellWords = ValueNotifier(const []);
 
   /// Already-handled #[phrase] tags this run, so retyping never fires twice.
   final Set<String> _handledPhrase = {};
@@ -229,14 +247,66 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  /// Test hook: inject a tiny dictionary instead of the asset bundle.
+  @visibleForTesting
+  void debugUseSpell(SpellCheck checker) {
+    _spell = checker;
+    _highlighter.call(_applyHighlight);
+  }
+
   bool _spellCorrect(String word) {
+    final lower = word.toLowerCase();
+    if (_learned.contains(lower)) return true;
     final checker = _spell;
     if (checker == null) return true;
     try {
-      return checker.isCorrect(word) ||
-          checker.isCorrect(word.toLowerCase());
+      return checker.isCorrect(word) || checker.isCorrect(lower);
     } catch (_) {
       return true;
+    }
+  }
+
+  /// Teach the checker a word (Learn spelling), then re-mark the note.
+  Future<void> _learnWord(String word,
+      [QuillRawEditorState? rawState]) async {
+    final k = word.trim().toLowerCase();
+    if (k.isEmpty) return;
+    setState(() => _learned.add(k));
+    await widget.storage.saveLearned(_learned.toList());
+    rawState?.hideToolbar();
+    _highlighter.call(_applyHighlight);
+  }
+
+  /// Replace every occurrence of a typo with the picked suggestion,
+  /// keeping an initial capital when the typo had one.
+  void _fixTypoEverywhere(String wrong, String right) {
+    final w = wrong.trim();
+    var r = right.trim();
+    if (w.isEmpty || r.isEmpty) return;
+    String text;
+    try {
+      text = _quill.document.toPlainText();
+    } catch (_) {
+      return;
+    }
+    final re = RegExp('\\b${RegExp.escape(w)}\\b', caseSensitive: false);
+    final ranges = re
+        .allMatches(text)
+        .map((m) => (m.start, m.end, m.group(0)!))
+        .toList();
+    if (ranges.isEmpty) return;
+    for (var i = ranges.length - 1; i >= 0; i--) {
+      final r0 = ranges[i];
+      var rep = r;
+      final first = r0.$3[0];
+      if (first.toUpperCase() == first &&
+          first.toLowerCase() != first) {
+        rep = r[0].toUpperCase() + r.substring(1);
+      }
+      try {
+        _quill.replaceText(r0.$1, r0.$2 - r0.$1, rep,
+            TextSelection.collapsed(offset: r0.$1 + rep.length));
+      } catch (_) {}
     }
   }
 
@@ -244,6 +314,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     var sessions = await widget.storage.loadSessions();
     final storedFolders = await widget.storage.loadFolders();
     _knownFolders.addAll(storedFolders);
+    _learned.addAll(await widget.storage.loadLearned());
     // One-time upgrade: fold the old single sheet.txt into a session.
     final legacy = await widget.storage.takeLegacySheet();
     if (legacy != null) {
@@ -674,6 +745,17 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         for (final r in spellRanges)
           if (!covers(greenPos, r.$1, r.$2)) r
       ];
+      // Publish the distinct typo words for the fix-it sheet.
+      final seen = <String>{};
+      final typoWords = <String>[];
+      for (final r in spellWanted) {
+        final w = text.substring(r.$1, r.$2);
+        final k = w.toLowerCase();
+        if (seen.add(k)) typoWords.add(w);
+      }
+      if (!_listEquals(typoWords, _spellWords.value)) {
+        _spellWords.value = typoWords;
+      }
       for (final r in current.spell) {
         if (!covers(spellWanted, r.$1, r.$2)) {
           _quill.formatText(
@@ -733,7 +815,306 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     return (green: green, strike: strike, red: red, spell: spell);
   }
 
-  /// True when the caret sits right on an image embed.
+  /// Fix-it sheet: every flagged word with suggestions + Learn.
+  void _openSpellSheet() {
+    final typos = List<String>.of(_spellWords.value);
+    if (typos.isEmpty) return;
+    final Map<String, List<String>> suggestions = {};
+    for (final w in typos) {
+      try {
+        suggestions[w] =
+            _spell?.didYouMeanAny(w, maxWords: 4).take(3).toList() ?? [];
+      } catch (_) {
+        suggestions[w] = [];
+      }
+    }
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        decoration: const BoxDecoration(
+          color: PaperTheme.paper,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        ),
+        padding:
+            const EdgeInsets.fromLTRB(18, 10, 18, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: PaperTheme.line,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Possible typos — tap a fix',
+              style: TextStyle(
+                  color: PaperTheme.ink,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  for (final w in typos)
+                    Padding(
+                      padding:
+                          const EdgeInsets.symmetric(vertical: 5),
+                      child: Column(
+                        crossAxisAlignment:
+                            CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  w,
+                                  style: const TextStyle(
+                                      color: PaperTheme.ink,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              InkWell(
+                                onTap: () {
+                                  Navigator.of(ctx).pop();
+                                  _learnWord(w);
+                                },
+                                borderRadius:
+                                    BorderRadius.circular(10),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 10, vertical: 5),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                        color:
+                                            PaperTheme.lineThin),
+                                    borderRadius:
+                                        BorderRadius.circular(10),
+                                  ),
+                                  child: const Text('Learn',
+                                      style: TextStyle(
+                                          color:
+                                              PaperTheme.inkSoft,
+                                          fontSize: 11)),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          Wrap(
+                            spacing: 6,
+                            runSpacing: 6,
+                            children: [
+                              for (final s
+                                  in suggestions[w] ?? const <String>[])
+                                InkWell(
+                                  onTap: () {
+                                    Navigator.of(ctx).pop();
+                                    _fixTypoEverywhere(w, s);
+                                  },
+                                  borderRadius:
+                                      BorderRadius.circular(12),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: PaperTheme.surface,
+                                      border: Border.all(
+                                          color: PaperTheme.lineThin),
+                                      borderRadius:
+                                          BorderRadius.circular(12),
+                                    ),
+                                    child: Text(s,
+                                        style: const TextStyle(
+                                            color: PaperTheme.ink,
+                                            fontSize: 12.5)),
+                                  ),
+                                ),
+                              if ((suggestions[w] ?? const []).isEmpty)
+                                const Text(
+                                  'no close match found',
+                                  style: TextStyle(
+                                      color: PaperTheme.inkSoft,
+                                      fontSize: 11,
+                                      fontStyle: FontStyle.italic),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Right-click menu: spelling suggestions + Learn when on a typo,
+  /// then the standard Cut / Copy / Paste / Select All.
+  Widget _spellMenu(BuildContext context, QuillRawEditorState rawState) {
+    String word = '';
+    int start = -1;
+    int end = -1;
+    try {
+      final text = _quill.document.toPlainText();
+      final sel = _quill.selection;
+      final cursor = sel.baseOffset.clamp(0, text.length);
+      if (sel.start != sel.end) {
+        final picked =
+            text.substring(sel.start.clamp(0, text.length), cursor).trim();
+        if (!picked.contains(RegExp(r'\s'))) {
+          word = picked;
+          start = sel.start;
+          end = cursor;
+        }
+      } else {
+        final m = RegExp(r"[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?",
+                unicode: true)
+            .allMatches(text)
+            .where((e) => e.start <= cursor && cursor <= e.end);
+        if (m.isNotEmpty) {
+          word = m.first.group(0)!;
+          start = m.first.start;
+          end = m.first.end;
+        }
+      }
+    } catch (_) {}
+    final misspelled = word.length >= 2 && !_spellCorrect(word);
+    List<String> suggestions = const [];
+    if (misspelled && _spell != null) {
+      try {
+        suggestions =
+            _spell!.didYouMeanAny(word, maxWords: 4).take(4).toList();
+      } catch (_) {}
+    }
+    final collapsed =
+        _quill.selection.start == _quill.selection.end;
+
+    Widget row({
+      required IconData icon,
+      required String label,
+      required bool enabled,
+      required VoidCallback onTap,
+    }) {
+      return InkWell(
+        onTap: enabled
+            ? () {
+                rawState.hideToolbar();
+                onTap();
+              }
+            : null,
+        child: Opacity(
+          opacity: enabled ? 1 : 0.45,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(
+                horizontal: 14, vertical: 9),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 15, color: PaperTheme.inkSoft),
+                const SizedBox(width: 10),
+                Text(label,
+                    style: const TextStyle(
+                        color: PaperTheme.ink, fontSize: 13)),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    void replaceWith(String replacement) {
+      if (start < 0 || end <= start) return;
+      _quill.replaceText(
+          start,
+          end - start,
+          replacement,
+          TextSelection.collapsed(
+              offset: start + replacement.length));
+    }
+
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        width: 230,
+        decoration: BoxDecoration(
+          color: const Color(0xFFF4EEDF),
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF3E3A31).withValues(alpha: 0.16),
+              blurRadius: 14,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (final s in suggestions)
+              row(
+                icon: Icons.spellcheck,
+                label: s,
+                enabled: true,
+                onTap: () => replaceWith(s),
+              ),
+            if (misspelled)
+              row(
+                icon: Icons.school_outlined,
+                label: 'Learn spelling',
+                enabled: true,
+                onTap: () => _learnWord(word, rawState),
+              ),
+            if (misspelled || suggestions.isNotEmpty)
+              const Divider(height: 1, color: PaperTheme.lineThin),
+            row(
+              icon: Icons.content_cut,
+              label: 'Cut',
+              enabled: !collapsed,
+              onTap: () => rawState
+                  .cutSelection(SelectionChangedCause.keyboard),
+            ),
+            row(
+              icon: Icons.copy,
+              label: 'Copy',
+              enabled: !collapsed,
+              onTap: () => rawState
+                  .copySelection(SelectionChangedCause.keyboard),
+            ),
+            row(
+              icon: Icons.paste,
+              label: 'Paste',
+              enabled: true,
+              onTap: () async =>
+                  rawState.pasteText(SelectionChangedCause.keyboard),
+            ),
+            row(
+              icon: Icons.select_all,
+              label: 'Select All',
+              enabled: true,
+              onTap: () => rawState
+                  .selectAll(SelectionChangedCause.keyboard),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
   bool _caretOnImage() {
     try {
       final res = getEmbedNode(_quill, _quill.selection.start);
@@ -1973,6 +2354,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                       focusNode: _focusNode,
                                       scrollController: _scrollCtrl,
                                       config: QuillEditorConfig(
+                                        contextMenuBuilder: _spellMenu,
                                         embedBuilders: kIsWeb
                                             ? FlutterQuillEmbeds
                                                 .editorWebBuilders()
@@ -1993,17 +2375,74 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                               ),
                               Padding(
                                 padding: const EdgeInsets.only(top: 6),
-                                child: Align(
-                                  alignment: Alignment.centerRight,
-                                  child: ValueListenableBuilder<int>(
-                                    valueListenable: _wordCount,
-                                    builder: (context, n, _) => Text(
-                                      '$n ${n == 1 ? 'word' : 'words'}',
-                                      style: const TextStyle(
-                                          color: PaperTheme.inkSoft,
-                                          fontSize: 10.5),
+                                child: Row(
+                                  children: [
+                                    ValueListenableBuilder<List<String>>(
+                                      valueListenable: _spellWords,
+                                      builder: (context, typos, _) {
+                                        if (typos.isEmpty) {
+                                          return const SizedBox.shrink();
+                                        }
+                                        return InkWell(
+                                          onTap: _openSpellSheet,
+                                          borderRadius:
+                                              BorderRadius.circular(12),
+                                          child: Container(
+                                            padding:
+                                                const EdgeInsets.symmetric(
+                                                    horizontal: 9,
+                                                    vertical: 4),
+                                            decoration: BoxDecoration(
+                                              color: const Color(
+                                                  0xFFFFDFB0),
+                                              border: Border.all(
+                                                  color: PaperTheme
+                                                      .lineThin),
+                                              borderRadius:
+                                                  BorderRadius.circular(
+                                                      12),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize:
+                                                  MainAxisSize.min,
+                                              children: [
+                                                const Icon(
+                                                    Icons.spellcheck,
+                                                    size: 13,
+                                                    color:
+                                                        PaperTheme.ink),
+                                                const SizedBox(width: 4),
+                                                Text(
+                                                  '${typos.length} to fix',
+                                                  style: const TextStyle(
+                                                      color:
+                                                          PaperTheme
+                                                              .ink,
+                                                      fontSize: 11,
+                                                      fontWeight:
+                                                          FontWeight
+                                                              .w600),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
                                     ),
-                                  ),
+                                    const Spacer(),
+                                    Align(
+                                      alignment: Alignment.centerRight,
+                                      child: ValueListenableBuilder<int>(
+                                        valueListenable: _wordCount,
+                                        builder: (context, n, _) => Text(
+                                          '$n ${n == 1 ? 'word' : 'words'}',
+                                          style: const TextStyle(
+                                              color: PaperTheme.inkSoft,
+                                              fontSize: 10.5),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ),
                               ),
                             ],
