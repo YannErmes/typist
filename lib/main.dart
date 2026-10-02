@@ -42,7 +42,9 @@ void main() {
 StorageService? crashStorage;
 
 class WordGraphToolApp extends StatelessWidget {
-  const WordGraphToolApp({super.key});
+  /// Shared storage (tests inject one instance across restarts).
+  final StorageService? storage;
+  const WordGraphToolApp({super.key, this.storage});
 
   @override
   Widget build(BuildContext context) {
@@ -56,21 +58,22 @@ class WordGraphToolApp extends StatelessWidget {
         GlobalWidgetsLocalizations.delegate,
         FlutterQuillLocalizations.delegate,
       ],
-      home: const HomeShell(),
+      home: HomeShell(storage: storage),
     );
   }
 }
 
 /// Three views: Sheet (writing), Graph (word network), Banned (forbidden).
 class HomeShell extends StatefulWidget {
-  const HomeShell({super.key});
+  final StorageService? storage;
+  const HomeShell({super.key, this.storage});
 
   @override
   State<HomeShell> createState() => _HomeShellState();
 }
 
 class _HomeShellState extends State<HomeShell> {
-  final StorageService _storage = StorageService();
+  late final StorageService _storage;
   final WordGraph _graph = WordGraph();
   final GlobalKey<SheetViewState> _sheetKey = GlobalKey<SheetViewState>();
 
@@ -84,6 +87,7 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void initState() {
     super.initState();
+    _storage = widget.storage ?? StorageService();
     crashStorage = _storage;
     _boot();
   }

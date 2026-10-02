@@ -177,10 +177,11 @@ class StorageService {
     try {
       await for (final ent in _sheetsDir!.list()) {
         if (ent is! File || !ent.path.endsWith('.json')) continue;
+        final base = ent.path.split(Platform.pathSeparator).last;
+        if (base.endsWith('.bak.json')) continue; // safety copies
         try {
           final raw =
               jsonDecode(await ent.readAsString()) as Map<String, dynamic>;
-          final base = ent.path.split(Platform.pathSeparator).last;
           final id = base.substring(0, base.length - 5);
           final title = (raw['title'] as String?)?.trim();
           out.add(WritingSession(
@@ -226,14 +227,47 @@ class StorageService {
       return;
     }
     try {
-      await File(_sessionFile(id)).writeAsString(jsonEncode({
+      final content = jsonEncode({
         'title': title,
         'updatedAt': now,
         'delta': deltaJson,
         'folder': cleanFolder,
-      }));
+      });
+      final file = File(_sessionFile(id));
+      // Rotate a backup first: if anything ever writes a bad version,
+      // the previous one survives next to it as <id>.bak.json.
+      try {
+        if (await file.exists()) {
+          final prev = await file.readAsString();
+          if (prev != content) {
+            await File('${_sessionFile(id)}.bak.json')
+                .writeAsString(prev);
+          }
+        }
+      } catch (_) {}
+      await file.writeAsString(content);
     } catch (_) {
       // Silent: never interrupt typing for IO errors.
+    }
+  }
+
+  /// Salvage plain text from a delta that no longer parses as a document
+  /// (strict formatting must never blank someone's words). Null = hopeless.
+  static String? recoverPlainText(String? deltaJson) {
+    if (deltaJson == null || deltaJson.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(deltaJson);
+      if (decoded is! List) return null;
+      final buf = StringBuffer();
+      for (final op in decoded) {
+        if (op is Map && op['insert'] is String) {
+          buf.write(op['insert'] as String);
+        }
+      }
+      final text = buf.toString();
+      return text.trim().isEmpty ? null : text;
+    } catch (_) {
+      return null;
     }
   }
 
@@ -251,6 +285,8 @@ class StorageService {
     try {
       final file = File(_sessionFile(id));
       if (await file.exists()) await file.delete();
+      final bak = File('${_sessionFile(id)}.bak.json');
+      if (await bak.exists()) await bak.delete();
     } catch (_) {}
   }
 

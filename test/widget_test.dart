@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_quill/flutter_quill.dart' show Document;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:word_graph_tool/graph_model.dart';
 import 'package:word_graph_tool/graph_view.dart';
@@ -92,6 +93,32 @@ void main() {
         '# eat\nparents: meal, food\nchildren: orange\n');
     expect(back, isNotNull);
     expect(back!.links, {'meal', 'food', 'orange'});
+  });
+
+  test('complex formatting survives a save-load round trip', () {
+    final delta = [
+      {'insert': 'Hello '},
+      {
+        'insert': 'world',
+        'attributes': {'bold': true, 'background': '#f69697'}
+      },
+      {
+        'insert': {'image': 'https://example.com/a.png'}
+      },
+      {
+        'insert': {'image': 'https://example.com/b.png'},
+        'attributes': {
+          'style': 'width: 100px; alignment: centerLeft'
+        }
+      },
+      {'insert': 'linky', 'attributes': {'link': 'https://example.com'}},
+      {'insert': '\n', 'attributes': {'list': 'bullet'}},
+      {'insert': 'struck', 'attributes': {'strike': true, 'color': '#b3261e'}},
+      {'insert': '\n'},
+    ];
+    final doc = Document.fromJson(delta);
+    expect(doc.toPlainText(), contains('Hello'));
+    expect(doc.toPlainText(), contains('world'));
   });
 
   test('word counts ignore extra whitespace', () {
@@ -419,6 +446,38 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
     // Inspector open for the picked word (rename + meaning edit icons).
     expect(find.byIcon(Icons.edit_outlined), findsWidgets);
+  });
+
+  testWidgets('note body survives an app restart',
+      (WidgetTester tester) async {
+    final storage = StorageService();
+    Future<void> boot() async {
+      await tester.pumpWidget(WordGraphToolApp(storage: storage));
+      for (var i = 0;
+          i < 60 && find.byType(EditableText).evaluate().isEmpty;
+          i++) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+    }
+
+    await boot();
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .typeForTest('my precious four hundred words live here');
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    // Quit the app (unmount everything, like closing the window).
+    await tester.pumpWidget(Container());
+    await tester.pump(const Duration(milliseconds: 500));
+    // Launch again with the same storage: words must be back.
+    await boot();
+    final sheetState =
+        tester.state<SheetViewState>(find.byType(SheetView));
+    expect(sheetState.debugPlainText(),
+        contains('my precious four hundred words live here'));
+    // Let any pending debounce/highlight timers flush before teardown.
+    await tester.pump(const Duration(seconds: 1));
+    await tester.pump(const Duration(seconds: 1));
   });
 
   testWidgets('app boots to sheet view', (WidgetTester tester) async {

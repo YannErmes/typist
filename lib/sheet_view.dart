@@ -182,23 +182,41 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _sessions = sessions;
-      _activeId = sessions.first.id;
       _loaded = true;
     });
+    // NOTE: _activeId stays null until _openSession loads the doc.
+    // Setting it early would make the entry saveNow() below overwrite
+    // the newest note with the still-empty editor (data loss).
     await _openSession(sessions.first.id);
   }
 
+  int _openGen = 0;
+
   Future<void> _openSession(String id) async {
+    final gen = ++_openGen; // stale runs (rapid switches) must not win
     await _saveNow(); // never lose the session we leave
     final delta = await widget.storage.loadSessionDelta(id);
-    if (!mounted) return;
+    if (!mounted || gen != _openGen) return;
     _switching = true;
     try {
       if (delta == null || delta.isEmpty) {
         _quill.document = Document();
       } else {
-        _quill.document =
-            Document.fromJson(jsonDecode(delta) as List);
+        try {
+          _quill.document =
+              Document.fromJson(jsonDecode(delta) as List);
+        } catch (_) {
+          // Corrupt formatting must never blank the words: salvage text.
+          final salvaged = StorageService.recoverPlainText(delta);
+          if (salvaged == null || salvaged.trim().isEmpty) {
+            _quill.document = Document();
+          } else {
+            _quill.document =
+                Document.fromJson(jsonDecode(jsonEncode([
+              {'insert': salvaged}
+            ])) as List);
+          }
+        }
       }
       final session =
           _sessions.firstWhere((s) => s.id == id);
@@ -427,6 +445,10 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     if (!mounted) return;
     final remaining =
         _sessions.where((s) => s.id != id).toList();
+    final wasActive = _activeId == id;
+    // Clear first so the switch below can't re-save (resurrect) the
+    // deleted file with the still-loaded text.
+    if (wasActive) _activeId = null;
     if (remaining.isEmpty) {
       final created =
           await widget.storage.createSession('First notes');
@@ -436,7 +458,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       await _openSession(created.id);
     } else {
       setState(() => _sessions = remaining);
-      if (_activeId == id) await _openSession(remaining.first.id);
+      if (wasActive) await _openSession(remaining.first.id);
     }
   }
 
