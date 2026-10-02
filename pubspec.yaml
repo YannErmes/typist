@@ -34,7 +34,9 @@ dependencies:
     sdk: flutter
   flutter_quill: ^11.6.0
   flutter_quill_extensions: ^11.0.0
+  http: ^1.2.0
   path_provider: ^2.1.4
+  spell_check_on_client: ^1.0.1
 
 dev_dependencies:
   flutter_test:
@@ -60,6 +62,7 @@ flutter:
 
   assets:
     - assets/logo.png
+    - assets/spell/en_words.txt
 
   # To add assets to your application, add an assets section, like this:
   # assets:

@@ -103,7 +103,38 @@ class StorageService {
     }
   }
 
-  // ---- Explicit folders (so empty folders survive a restart) ----
+  // ---- Mistral API key (user-supplied, never shipped) ----
+  String _memoryAiKey = '';
+
+  File? get _aiKeyFile => _base == null
+      ? null
+      : File(
+          '${_base!.path}${Platform.pathSeparator}mistral_key.txt');
+
+  Future<String> loadAiKey() async {
+    final file = _aiKeyFile;
+    if (file == null) return _memoryAiKey.trim();
+    try {
+      if (!await file.exists()) return '';
+      return (await file.readAsString()).trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  Future<void> saveAiKey(String key) async {
+    final clean = key.trim();
+    final file = _aiKeyFile;
+    if (file == null) {
+      _memoryAiKey = clean;
+      return;
+    }
+    try {
+      await file.writeAsString(clean);
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
+  }
   List<String> _memoryFolders = [];
 
   File? get _foldersFile => _base == null

@@ -165,6 +165,17 @@ class GraphViewState extends State<GraphView> {
   static const double _levelGap = 148;
   static const double _margin = 140;
 
+  /// Board limits: words always stay on reachable canvas.
+  static const double _boardMin = 40;
+  static const double _boardMax = 5600;
+  static const double _canvasMax = 6200;
+
+  /// Clamp a canvas point onto the reachable board.
+  static Offset _clampBoard(Offset p) => Offset(
+        p.dx.clamp(_boardMin, _boardMax).toDouble(),
+        p.dy.clamp(_boardMin, _boardMax).toDouble(),
+      );
+
   @override
   void dispose() {
     _linkedCtrl.dispose();
@@ -178,9 +189,11 @@ class GraphViewState extends State<GraphView> {
   void initState() {
     super.initState();
     // Adopt saved arrangement: the map opens exactly as it was left.
+    // Bad or unreachable spots are pulled back onto the board.
     for (final n in widget.graph.nodes.values) {
-      if (n.hasPos) {
-        _customPos[WordGraph.norm(n.name)] = Offset(n.x!, n.y!);
+      if (n.hasPos && n.x!.isFinite && n.y!.isFinite) {
+        _customPos[WordGraph.norm(n.name)] =
+            _clampBoard(Offset(n.x!, n.y!));
       }
     }
     final init = widget.initialWord;
@@ -527,7 +540,7 @@ class GraphViewState extends State<GraphView> {
     if (!_linkMode) {
       // Pin the exact pointer spot so the drop is kept precisely.
       if (word != null) {
-        final c = _toCanvas(e.position) + _grabOffset;
+        final c = _clampBoard(_toCanvas(e.position) + _grabOffset);
         setState(() {
           _draggingNode = null;
           _customPos[word] = c;
@@ -582,6 +595,31 @@ class GraphViewState extends State<GraphView> {
     final m2 = _pan.value.clone();
     m2.scaleByDouble(target / cur, target / cur, target / cur, 1.0);
     _pan.value = m2;
+  }
+
+  /// Fit every word into view (rescues bubbles parked off-screen).
+  void _fitView() {
+    if (_lastPlaced.isEmpty) return;
+    final vw = _viewportSize.width;
+    final vh = _viewportSize.height;
+    if (vw <= 0 || vh <= 0) return;
+    var minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9;
+    for (final c in _lastPlaced.values) {
+      if (c.dx < minX) minX = c.dx;
+      if (c.dy < minY) minY = c.dy;
+      if (c.dx > maxX) maxX = c.dx;
+      if (c.dy > maxY) maxY = c.dy;
+    }
+    const pad = 140.0;
+    final bw = math.max(200.0, maxX - minX + pad * 2);
+    final bh = math.max(200.0, maxY - minY + pad * 2);
+    final s = (math.min(vw / bw, vh / bh)).clamp(0.2, 1.0);
+    final cx = (minX + maxX) / 2;
+    final cy = (minY + maxY) / 2;
+    final base = Matrix4.translationValues(
+        vw / 2 - cx * s, vh / 2 - cy * s, 0.0);
+    final m = base..scaleByDouble(s, s, s, 1.0);
+    setState(() => _pan.value = m);
   }
 
   Future<void> _addLinked() async {
@@ -876,8 +914,8 @@ class GraphViewState extends State<GraphView> {
       if (p.center.dx > maxRight) maxRight = p.center.dx;
       if (p.center.dy > maxBottom) maxBottom = p.center.dy;
     }
-    final w = math.max(2200.0, maxRight + _margin);
-    final h = math.max(1500.0, maxBottom + _margin);
+    final w = math.max(2200.0, maxRight + _margin).clamp(0.0, _canvasMax);
+    final h = math.max(1500.0, maxBottom + _margin).clamp(0.0, _canvasMax);
     return (placed: placed, edges: edges, canvas: Size(w, h));
   }
 
@@ -1424,6 +1462,15 @@ class GraphViewState extends State<GraphView> {
                                               ? PaperTheme.ink
                                               : PaperTheme
                                                   .inkSoft),
+                                    ),
+                                    IconButton(
+                                      tooltip: 'Fit everything in view',
+                                      onPressed: _fitView,
+                                      icon: const Icon(
+                                          Icons.fit_screen,
+                                          size: 16,
+                                          color:
+                                              PaperTheme.inkSoft),
                                     ),
                                     IconButton(
                                       tooltip: 'Zoom out',

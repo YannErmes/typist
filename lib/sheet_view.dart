@@ -2,7 +2,9 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData, rootBundle;
+import 'package:spell_check_on_client/spell_check_on_client.dart';
 import 'package:flutter_quill/flutter_quill.dart'
     show
         Attribute,
@@ -21,6 +23,7 @@ import 'package:flutter_quill/flutter_quill.dart'
         getEmbedNode;
 import 'package:flutter_quill_extensions/flutter_quill_extensions.dart';
 
+import 'ai_service.dart';
 import 'graph_model.dart';
 import 'storage.dart';
 import 'tag_sheet.dart';
@@ -82,6 +85,34 @@ int countWords(String text) {
       .length;
 }
 
+/// Fill flagging possible typos (offline dictionary).
+const String _spellHex = '#ffdfb0';
+
+/// Ranges of likely-misspelled words. Skips the word under [cursor]
+/// (still being typed), tokens without letters, and bits of links/tags.
+List<(int, int)> findUnknownRanges(
+  String text,
+  bool Function(String word) isCorrect, {
+  int cursor = -1,
+}) {
+  final out = <(int, int)>[];
+  final token =
+      RegExp(r"[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?", unicode: true);
+  final hasLetter = RegExp(r'\p{L}', unicode: true);
+  for (final m in token.allMatches(text)) {
+    final w = m.group(0)!;
+    if (w.length < 2 || !hasLetter.hasMatch(w)) continue;
+    if (cursor >= 0 && m.start <= cursor && cursor <= m.end) continue;
+    final before = m.start > 0 ? text[m.start - 1] : ' ';
+    final after = m.end < text.length ? text[m.end] : ' ';
+    if ('.@/#:;'.contains(before) || '.@/#:;'.contains(after)) continue;
+    try {
+      if (!isCorrect(w)) out.add((m.start, m.end));
+    } catch (_) {}
+  }
+  return out;
+}
+
 /// Writing view: titled sessions in a left rail, a styled editor
 /// (bold / italic / underline / text color / highlight / headers / lists)
 /// and @ mentions — typing @ pops up the words from the mind-map,
@@ -132,6 +163,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   /// Collapsed folders in the rail (everything expanded by default).
   final Set<String> _collapsedFolders = {};
 
+  /// Offline spell checker (null until the dictionary asset loads).
+  SpellCheck? _spell;
+
   /// Live word count of the open note.
   final ValueNotifier<int> _wordCount = ValueNotifier(0);
 
@@ -142,10 +176,28 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   final LayerLink _layerLink = LayerLink();
   final GlobalKey _editorKey = GlobalKey();
   OverlayEntry? _overlay;
-  String _popupKind = 'mention'; // 'mention' or 'hash'
+  String _popupKind = 'mention'; // 'mention', 'hash' or 'ai'
   List<String> _matches = [];
   String _frag = '';
   String _hashFrag = '';
+
+  // @ai mini-chat (stateless: nothing is ever saved).
+  bool _aiOpen = false;
+  final TextEditingController _aiQ = TextEditingController();
+  final TextEditingController _aiKeyField = TextEditingController();
+  MistralClient _aiClient = MistralClient();
+
+  /// Test hook: swap the network client for a fake.
+  @visibleForTesting
+  void debugSetAiClient(MistralClient client) {
+    _aiClient.dispose();
+    _aiClient = client;
+  }
+  String? _aiAnswer;
+  String _aiError = '';
+  bool _aiBusy = false;
+  String? _aiKey; // null = not loaded yet
+  bool _editingKey = false;
   Offset _popupOffset = const Offset(0, 40);
   double _editorWidth = 600;
 
@@ -159,6 +211,33 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _quill.addListener(_onDocChanged);
     _titleCtrl.addListener(_onTitleChanged);
     _boot();
+    _initSpell();
+  }
+
+  /// Load the offline dictionary; silently off if the asset is missing.
+  /// Wordlist vendored from spell_check_on_client's example assets.
+  Future<void> _initSpell() async {
+    try {
+      final content =
+          await rootBundle.loadString('assets/spell/en_words.txt');
+      if (!mounted) return;
+      setState(() => _spell = SpellCheck.fromWordsContent(
+            content,
+            letters: LanguageLetters.getLanguageForLanguage('en'),
+          ));
+      _highlighter.call(_applyHighlight);
+    } catch (_) {}
+  }
+
+  bool _spellCorrect(String word) {
+    final checker = _spell;
+    if (checker == null) return true;
+    try {
+      return checker.isCorrect(word) ||
+          checker.isCorrect(word.toLowerCase());
+    } catch (_) {
+      return true;
+    }
   }
 
   Future<void> _boot() async {
@@ -524,7 +603,17 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       final strikeRanges = findGraphMatches(text, widget.forbidden)
           .map((m) => (m.start, m.end))
           .toList();
-      final current = _currentMarks(_managedHexes(widget.graph));
+      final spellRanges = _spell == null
+          ? const <(int, int)>[]
+          : findUnknownRanges(
+              text, _spellCorrect,
+              cursor: _quill.selection.isValid
+                  ? _quill.selection.baseOffset
+                  : -1);
+      final current = _currentMarks({
+        ..._managedHexes(widget.graph),
+        _spellHex,
+      });
       bool covers(List<(int, int)> list, int s, int e) {
         for (final r in list) {
           if (r.$1 <= s && r.$2 >= e) return true;
@@ -577,21 +666,44 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
               r.$1, r.$2 - r.$1, const ColorAttribute(_banRedHex));
         }
       }
+      final greenPos = [
+        for (final r in greenRanges) (r.start, r.end)
+      ];
+      // Graph words are known words: never flagged as typos.
+      final spellWanted = [
+        for (final r in spellRanges)
+          if (!covers(greenPos, r.$1, r.$2)) r
+      ];
+      for (final r in current.spell) {
+        if (!covers(spellWanted, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const BackgroundAttribute(null));
+        }
+      }
+      for (final r in spellWanted) {
+        if (!covers(current.spell, r.$1, r.$2)) {
+          _quill.formatText(
+              r.$1, r.$2 - r.$1, const BackgroundAttribute(_spellHex));
+        }
+      }
     } catch (_) {
       // Never interrupt writing for highlight housekeeping.
     } finally {
       _applyingHighlight = false;
     }
   }
-  /// Live ranges currently wearing a managed fill / a strike / ban red.
+  /// Live ranges currently wearing a managed fill / a strike / ban red /
+  /// the spell flag.
   ({
     List<({int start, int end, String hex})> green,
     List<(int, int)> strike,
     List<(int, int)> red,
+    List<(int, int)> spell,
   }) _currentMarks(Set<String> managed) {
     final green = <({int start, int end, String hex})>[];
     final strike = <(int, int)>[];
     final red = <(int, int)>[];
+    final spell = <(int, int)>[];
     var pos = 0;
     try {
       for (final op in _quill.document.toDelta().toList()) {
@@ -604,6 +716,10 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
           green.add(
               (start: pos, end: pos + len, hex: bg.toString().toLowerCase()));
         }
+        if (bg != null &&
+            bg.toString().toLowerCase() == _spellHex) {
+          spell.add((pos, pos + len));
+        }
         if (attrs != null && attrs['strike'] == true) {
           strike.add((pos, pos + len));
         }
@@ -614,7 +730,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         pos += len;
       }
     } catch (_) {}
-    return (green: green, strike: strike, red: red);
+    return (green: green, strike: strike, red: red, spell: spell);
   }
 
   /// True when the caret sits right on an image embed.
@@ -672,6 +788,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _saver.dispose();
     _highlighter.dispose();
     _wordCount.dispose();
+    _aiQ.dispose();
+    _aiKeyField.dispose();
+    _aiClient.dispose();
     _removeOverlay();
     WidgetsBinding.instance.removeObserver(this);
     _quill.removeListener(_onDocChanged);
@@ -793,14 +912,22 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
 
   void _updateLookup() {
     if (!_loaded || _activeId == null) return;
+    if (_aiOpen) {
+      _overlay?.markNeedsBuild();
+      return;
+    }
     // Never hijack an active text selection with the popup.
     if (_quill.selection.start != _quill.selection.end) {
       _removeOverlay();
       return;
     }
-    // @word → mention list from the map.
+    // @ai -> mini-chat instead of the word list.
     final mention = _detectMention();
     if (mention != null) {
+      if (mention == 'ai') {
+        _openAiChat();
+        return;
+      }
       final all = widget.graph.sortedKeys();
       final starts = [
         for (final k in all)
@@ -877,7 +1004,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
-              onTap: _removeOverlay,
+              onTap: _dismissPopup,
             ),
           ),
           CompositedTransformFollower(
@@ -900,8 +1027,108 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _overlay = null;
   }
 
-  /// Tiny floating popup — mention list or # chooser by mode.
+  /// User-visible dismiss (barrier tap, × buttons): also closes chat mode
+  /// so a later @ai starts fresh. Plain _removeOverlay keeps _aiOpen so
+  /// _showOverlay can replace the entry while opening.
+  void _dismissPopup() {
+    _aiOpen = false;
+    _removeOverlay();
+  }
+
+  /// @ai typed: consume the token like a slash command and open the
+  /// mini-chat. Nothing about the chat is saved anywhere.
+  void _openAiChat() {
+    try {
+      final text = _quill.document.toPlainText();
+      final cursor =
+          _quill.selection.baseOffset.clamp(0, text.length);
+      int i = cursor - 1;
+      while (i >= 0 && _isWordChar(text[i])) {
+        i--;
+      }
+      if (i >= 0 && text.substring(i, cursor).toLowerCase() == '@ai') {
+        _quill.replaceText(i, cursor - i, '',
+            TextSelection.collapsed(offset: i));
+      }
+    } catch (_) {}
+    _aiOpen = true;
+    _popupKind = 'ai';
+    _aiAnswer = null;
+    _aiError = '';
+    _aiBusy = false;
+    _aiQ.clear();
+    _aiKey = null;
+    _editingKey = false;
+    _estimateCaretOffset();
+    if (_overlay == null) {
+      _showOverlay();
+    } else {
+      _overlay!.markNeedsBuild();
+    }
+    _loadAiKey();
+  }
+
+  Future<void> _loadAiKey() async {
+    final k = await widget.storage.loadAiKey();
+    if (!mounted || !_aiOpen) return;
+    _aiKey = k;
+    _refreshAiCard();
+  }
+
+  /// The popup lives in its own overlay tree: SheetView setState alone
+  /// never repaints it, so every AI state change refreshes it explicitly.
+  void _refreshAiCard() {
+    if (mounted) setState(() {});
+    _overlay?.markNeedsBuild();
+  }
+
+  Future<void> _saveAiKeyField() async {
+    final key = _aiKeyField.text.trim();
+    if (key.isEmpty) return;
+    await widget.storage.saveAiKey(key);
+    if (!mounted) return;
+    _aiKey = key;
+    _editingKey = false;
+    _aiError = '';
+    _refreshAiCard();
+  }
+
+  Future<void> _askAi() async {
+    final key = _aiKey ?? await widget.storage.loadAiKey();
+    if (!mounted || !_aiOpen) return;
+    _aiKey = key;
+    _aiError = '';
+    _refreshAiCard();
+    if (key.isEmpty) {
+      _aiError = 'Paste your Mistral API key first.';
+      _refreshAiCard();
+      return;
+    }
+    final q = _aiQ.text.trim();
+    if (q.isEmpty) return;
+    _aiBusy = true;
+    _aiError = '';
+    _aiAnswer = null;
+    _refreshAiCard();
+    try {
+      final answer = await _aiClient.ask(key, q);
+      if (!mounted || !_aiOpen) return;
+      _aiAnswer = answer;
+      _aiBusy = false;
+      _refreshAiCard();
+    } catch (e) {
+      if (!mounted || !_aiOpen) return;
+      final msg = e.toString();
+      _aiError = msg;
+      _aiBusy = false;
+      if (msg.contains('401')) _editingKey = true;
+      _refreshAiCard();
+    }
+  }
+
+  /// Tiny floating popup — mention list, # chooser or mini-chat by mode.
   Widget _buildPicker() {
+    if (_popupKind == 'ai') return _buildAiCard();
     if (_popupKind == 'hash') return _buildChooser();
     return Material(
       color: Colors.transparent,
@@ -939,7 +1166,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                     ),
                   ),
                   InkWell(
-                    onTap: _removeOverlay,
+                    onTap: _dismissPopup,
                     borderRadius: BorderRadius.circular(12),
                     child: const Padding(
                       padding: EdgeInsets.all(4),
@@ -999,6 +1226,266 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   }
 
   /// #word chooser: ban the typed word or put it on the map.
+  /// @ai mini-chat card. Stateless across opens: closing discards all.
+  Widget _buildAiCard() {
+    final hasKey = (_aiKey ?? '').isNotEmpty;
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        width: 300,
+        constraints: const BoxConstraints(maxHeight: 380),
+        decoration: BoxDecoration(
+          color: const Color(0xFFF4EEDF),
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF3E3A31).withValues(alpha: 0.14),
+              blurRadius: 14,
+              offset: const Offset(0, 5),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 8, 6, 4),
+              child: Row(
+                children: [
+                  const Expanded(
+                    child: Text(
+                      'Ask Mistral',
+                      style: TextStyle(
+                        color: PaperTheme.inkSoft,
+                        fontSize: 11,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ),
+                  InkWell(
+                    onTap: _dismissPopup,
+                    borderRadius: BorderRadius.circular(12),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Icon(Icons.close,
+                          size: 14, color: PaperTheme.inkSoft),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: SingleChildScrollView(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    if (!hasKey || _editingKey) ...[
+                      const Text(
+                        'Paste your Mistral API key. It stays on this device.',
+                        style: TextStyle(
+                            color: PaperTheme.inkSoft,
+                            fontSize: 11),
+                      ),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: _aiKeyField,
+                        obscureText: true,
+                        onSubmitted: (_) => _saveAiKeyField(),
+                        style: const TextStyle(
+                            color: PaperTheme.ink, fontSize: 12),
+                        decoration: InputDecoration(
+                          hintText: 'mistral key…',
+                          hintStyle: const TextStyle(
+                              color: PaperTheme.inkSoft,
+                              fontSize: 11),
+                          filled: true,
+                          fillColor: PaperTheme.surface,
+                          contentPadding:
+                              const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 8),
+                          border: OutlineInputBorder(
+                            borderRadius:
+                                BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                                color: PaperTheme.lineThin),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius:
+                                BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                                color: PaperTheme.lineThin),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton(
+                          onPressed:
+                              _aiBusy ? null : _saveAiKeyField,
+                          child: const Text('Save key',
+                              style: TextStyle(
+                                  color: PaperTheme.ink,
+                                  fontWeight: FontWeight.w700)),
+                        ),
+                      ),
+                    ] else ...[
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text(
+                              'Key saved on this device.',
+                              style: TextStyle(
+                                  color: PaperTheme.inkSoft,
+                                  fontSize: 10),
+                            ),
+                          ),
+                          InkWell(
+                            onTap: () {
+                              _editingKey = true;
+                              _aiKeyField.clear();
+                              _refreshAiCard();
+                            },
+                            child: const Padding(
+                              padding: EdgeInsets.all(4),
+                              child: Text('change',
+                                  style: TextStyle(
+                                      color:
+                                          PaperTheme.inkSoft,
+                                      fontSize: 10,
+                                      decoration: TextDecoration
+                                          .underline)),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      TextField(
+                        controller: _aiQ,
+                        maxLines: 3,
+                        minLines: 1,
+                        onSubmitted: (_) => _askAi(),
+                        style: const TextStyle(
+                            color: PaperTheme.ink, fontSize: 12.5),
+                        decoration: InputDecoration(
+                          hintText:
+                              'e.g. what better word than happy can i use?',
+                          hintStyle: const TextStyle(
+                              color: PaperTheme.inkSoft,
+                              fontSize: 11),
+                          filled: true,
+                          fillColor: PaperTheme.surface,
+                          contentPadding:
+                              const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 8),
+                          border: OutlineInputBorder(
+                            borderRadius:
+                                BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                                color: PaperTheme.lineThin),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius:
+                                BorderRadius.circular(10),
+                            borderSide: const BorderSide(
+                                color: PaperTheme.lineThin),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton.icon(
+                          onPressed: _aiBusy ? null : _askAi,
+                          icon: _aiBusy
+                              ? const SizedBox(
+                                  width: 12,
+                                  height: 12,
+                                  child:
+                                      CircularProgressIndicator(
+                                          strokeWidth: 2),
+                                )
+                              : const Icon(Icons.send,
+                                  size: 14,
+                                  color: PaperTheme.ink),
+                          label: Text(
+                              _aiBusy ? 'thinking…' : 'Ask',
+                              style: const TextStyle(
+                                  color: PaperTheme.ink,
+                                  fontWeight: FontWeight.w700)),
+                        ),
+                      ),
+                    ],
+                    if (_aiError.isNotEmpty)
+                      Padding(
+                        padding:
+                            const EdgeInsets.only(bottom: 6),
+                        child: Text(
+                          _aiError,
+                          style: const TextStyle(
+                              color: Color(0xFF8F2F25),
+                              fontSize: 11),
+                        ),
+                      ),
+                    if (_aiAnswer != null) ...[
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: PaperTheme.surface,
+                          border: Border.all(
+                              color: PaperTheme.lineThin),
+                          borderRadius:
+                              BorderRadius.circular(10),
+                        ),
+                        child: SelectableText(
+                          _aiAnswer!,
+                          style: const TextStyle(
+                              color: PaperTheme.ink,
+                              fontSize: 12.5,
+                              height: 1.45),
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: TextButton.icon(
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(
+                                text: _aiAnswer!));
+                            _notice('Answer copied.');
+                          },
+                          icon: const Icon(Icons.copy,
+                              size: 13,
+                              color: PaperTheme.inkSoft),
+                          label: const Text('Copy',
+                              style: TextStyle(
+                                  color: PaperTheme.inkSoft,
+                                  fontSize: 11)),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.fromLTRB(12, 0, 12, 8),
+              child: Text(
+                'answers are not saved',
+                style: TextStyle(
+                    color: PaperTheme.inkSoft, fontSize: 9),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildChooser() {
     final frag = _hashFrag;
     final ready = frag.isNotEmpty;
@@ -1039,7 +1526,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                     ),
                   ),
                   InkWell(
-                    onTap: _removeOverlay,
+                    onTap: _dismissPopup,
                     borderRadius: BorderRadius.circular(12),
                     child: const Padding(
                       padding: EdgeInsets.all(4),

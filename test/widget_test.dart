@@ -3,15 +3,94 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_quill/flutter_quill.dart' show Document;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:spell_check_on_client/spell_check_on_client.dart';
+import 'package:word_graph_tool/ai_service.dart';
 import 'package:word_graph_tool/graph_model.dart';
 import 'package:word_graph_tool/graph_view.dart';
 import 'package:word_graph_tool/main.dart';
 import 'package:word_graph_tool/sheet_view.dart'
-    show SheetView, SheetViewState, countWords, findGraphMatches;
+    show
+        SheetView,
+        SheetViewState,
+        countWords,
+        findGraphMatches,
+        findUnknownRanges;
 import 'package:word_graph_tool/storage.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
 
 void main() {
+  test('mistral request is well-formed', () {
+    final req = buildChatRequest('a better word for happy?');
+    expect(req['model'], MistralClient.model);
+    final messages = req['messages'] as List;
+    expect(messages.length, 2);
+    expect((messages.last as Map)['content'],
+        'a better word for happy?');
+  });
+
+  test('mistral answer parses, errors stay friendly', () {
+    const body =
+        '{"choices":[{"message":{"content":"  delighted  "}}]}';
+    expect(parseChatAnswer(body), 'delighted');
+    expect(
+        MistralException.friendly(401, '{}').toString(),
+        contains('401'));
+    expect(
+        MistralException.friendly(429, '{}').toString(),
+        contains('429'));
+    expect(
+        MistralException.friendly(500, '{"message":"boom"}')
+            .toString(),
+        contains('boom'));
+  });
+
+  test('mistral ask works through a fake client', () async {
+    final client = MistralClient(
+      client: MockClient((request) async {
+        expect(request.headers['Authorization'],
+            'Bearer test-key');
+        expect(request.url.host, 'api.mistral.ai');
+        return http.Response(
+            '{"choices":[{"message":{"content":"joyful"}}]}',
+            200);
+      }),
+    );
+    expect(await client.ask('test-key', 'hi'), 'joyful');
+    final bad = MistralClient(
+      client: MockClient((_) async =>
+          http.Response('{"message":"nope"}', 401)),
+    );
+    try {
+      await bad.ask('wrong', 'hi');
+      fail('must throw');
+    } catch (e) {
+      expect(e.toString(), contains('401'));
+    }
+  });
+
+  test('unknown ranges skip typing word, links and numbers', () {
+    final checker = SpellCheck.fromWordsList(
+        ['hello', 'world', 'is', 'a', 'test', 'ok']);
+    bool dict(String w) =>
+        checker.isCorrect(w) || checker.isCorrect(w.toLowerCase());
+    const text = 'hello wrld, visit example.com at #tag and 2026 ok';
+    final hits = findUnknownRanges(text, dict, cursor: -1)
+        .map((r) => text.substring(r.$1, r.$2))
+        .toList();
+    expect(hits, contains('wrld'));
+    expect(hits, isNot(contains('hello')));
+    expect(hits, isNot(contains('tag')));
+    expect(hits, isNot(contains('2026')));
+    expect(hits, isNot(contains('example')));
+    // The word under the cursor is left alone.
+    final atCursor = findUnknownRanges('hello wrld', dict, cursor: 8)
+        .map((r) => 'hello wrld'.substring(r.$1, r.$2))
+        .toList();
+    expect(atCursor, isEmpty);
+  });
+
   test('graph connects, checks and cuts undirected links', () {
     final g = WordGraph();
     g.connect('meal', 'eat');
@@ -156,6 +235,62 @@ void main() {
     expect(await s.loadSessionDelta(a.id), contains('hello'));
     await s.deleteSession(a.id);
     expect(await s.loadSessionDelta(a.id), isNull);
+  });
+
+  testWidgets('@ai opens the mini-chat without touching the net',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    for (var i = 0;
+        i < 60 && find.byType(EditableText).evaluate().isEmpty;
+        i++) {
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .typeForTest('@ai');
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Ask Mistral'), findsOneWidget);
+    // The @ai token is consumed like a slash command.
+    final sheetState =
+        tester.state<SheetViewState>(find.byType(SheetView));
+    expect(sheetState.debugPlainText(), isNot(contains('@ai')));
+    // Save a key: the card must flip to the chat, not sit on the key page.
+    final cardField = find.byWidgetPredicate(
+        (w) => w is TextField && w.obscureText == true);
+    expect(cardField, findsOneWidget);
+    await tester.tap(cardField);
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.enterText(cardField, 'sk-test-key');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Save key'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.textContaining('what better word'), findsOneWidget);
+    // Ask through a fake backend: the answer must appear in the card.
+    sheetState.debugSetAiClient(MistralClient(
+      client: MockClient((_) async => http.Response(
+          '{"choices":[{"message":{"content":"joyful"}}]}', 200)),
+    ));
+    final questionField = find.byWidgetPredicate(
+        (w) => w is TextField && w.maxLines == 3);
+    expect(questionField, findsOneWidget);
+    await tester.tap(questionField);
+    await tester.pump(const Duration(milliseconds: 200));
+    await tester.enterText(questionField, 'better word for happy?');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Ask'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(
+        find.byWidgetPredicate((w) =>
+            w is SelectableText &&
+            (w.data ?? '').contains('joyful')),
+        findsOneWidget);
+    // Close the chat; nothing was saved anywhere.
+    await tester.tap(find.byIcon(Icons.close).last);
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Ask Mistral'), findsNothing);
   });
 
   testWidgets('@ mention inserts the word and pops its map',

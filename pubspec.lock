@@ -286,7 +286,7 @@ packages:
     source: hosted
     version: "0.15.7"
   http:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: http
       sha256: "87721a4a50b19c7f1d49001e51409bddc46303966ce89a65af4f4e6004896412"
@@ -682,6 +682,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.10.2"
+  spell_check_on_client:
+    dependency: "direct main"
+    description:
+      name: spell_check_on_client
+      sha256: "0896ffb2a1f28b1a2225c6832cc9fda4abe27382f4f9ae403825fa15bb5f57ef"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.1"
   stack_trace:
     dependency: transitive
     description:
