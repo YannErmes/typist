@@ -23,6 +23,7 @@ class StorageService {
   Directory? _base;
   Directory? _wordsDir;
   Directory? _sheetsDir;
+  Directory? _imagesDir;
   File? _legacySheetFile;
   File? _forbiddenFile;
 
@@ -49,9 +50,12 @@ class StorageService {
           '${_base!.path}${Platform.pathSeparator}words');
       _sheetsDir = Directory(
           '${_base!.path}${Platform.pathSeparator}sheets');
+      _imagesDir = Directory(
+          '${_base!.path}${Platform.pathSeparator}images');
       await _base!.create(recursive: true);
       await _wordsDir!.create(recursive: true);
       await _sheetsDir!.create(recursive: true);
+      await _imagesDir!.create(recursive: true);
       _legacySheetFile = File(
           '${_base!.path}${Platform.pathSeparator}sheet.txt');
       _forbiddenFile = File(
@@ -61,9 +65,40 @@ class StorageService {
       _base = null;
       _wordsDir = null;
       _sheetsDir = null;
+      _imagesDir = null;
       _legacySheetFile = null;
       _forbiddenFile = null;
     }
+  }
+
+  /// Copy a picked picture into the local images folder.
+  /// Returns the stored `images/<name>` reference, or null on failure.
+  Future<String?> importImageFile(String sourcePath) async {
+    try {
+      if (_imagesDir == null) return null;
+      final ext = sourcePath.split('.').last.toLowerCase();
+      final safeExt = RegExp(r'^[a-z0-9]{2,5}$').hasMatch(ext) ? ext : 'png';
+      final name =
+          '${DateTime.now().millisecondsSinceEpoch}.$safeExt';
+      await File(sourcePath)
+          .copy('${_imagesDir!.path}${Platform.pathSeparator}$name');
+      return 'images/$name';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Resolve an image reference to something displayable.
+  /// Returns a local file path, or the URL untouched for network images.
+  String? resolveImage(String ref) {
+    final t = ref.trim();
+    if (t.isEmpty || t.startsWith('mem:')) return null;
+    if (t.startsWith('http://') || t.startsWith('https://')) {
+      return t;
+    }
+    if (_base == null) return null;
+    final rel = t.startsWith('images/') ? t : 'images/$t';
+    return '${_base!.path}${Platform.pathSeparator}${rel.replaceAll('/', Platform.pathSeparator)}';
   }
 
   // ---- Forbidden words (one per line, auto-struck while writing) ----
@@ -428,6 +463,8 @@ class StorageService {
             .map(WordGraph.norm)
             .where((e) => e.isNotEmpty && graph.nodes.containsKey(e))
             .toSet();
+        n.jumps.removeWhere((k, v) =>
+            v.trim().isEmpty || !graph.nodes.containsKey(WordGraph.norm(k)));
       }
     } catch (_) {}
     return graph;
@@ -478,6 +515,19 @@ class StorageService {
     if (node.color != null) {
       buf.writeln('color: ${node.color}');
     }
+    final image = node.image?.trim();
+    if (image != null && image.isNotEmpty && !image.startsWith('mem:')) {
+      buf.writeln('image: $image');
+    }
+    final jumps = node.jumps.entries
+        .where((e) =>
+            e.key.trim().isNotEmpty && e.value.trim().isNotEmpty)
+        .map((e) => '${e.value.trim()}:${e.key.trim().toLowerCase()}')
+        .toList()
+      ..sort();
+    if (jumps.isNotEmpty) {
+      buf.writeln('jumps: ${jumps.join(', ')}');
+    }
     final meaning = node.meaning?.trim();
     if (meaning != null && meaning.isNotEmpty) {
       buf.writeln('## meaning');
@@ -488,8 +538,9 @@ class StorageService {
 
   static final _meaningHeader =
       RegExp(r'^#{2,}\s*meaning\s*$', caseSensitive: false);
-  static final _knownKey =
-      RegExp(r'^(links|parents|children|x|y|color)\s*:', caseSensitive: false);
+  static final _knownKey = RegExp(
+      r'^(links|parents|children|x|y|color|image|jumps)\s*:',
+      caseSensitive: false);
 
   static WordNode? parseWordFile(String content) {
     String? title;
@@ -497,6 +548,8 @@ class StorageService {
     double? x;
     double? y;
     int? color;
+    String? image;
+    Map<String, String> jumps = {};
     final meaningBuf = StringBuffer();
     var inMeaning = false;
     for (final rawLine in content.split('\n')) {
@@ -535,17 +588,33 @@ class StorageService {
       } else if (line.toLowerCase().startsWith('color:')) {
         color = int.tryParse(line.substring('color:'.length).trim()) ??
             color;
+      } else if (line.toLowerCase().startsWith('image:')) {
+        final v = line.substring('image:'.length).trim();
+        if (v.isNotEmpty) image = v;
+      } else if (line.toLowerCase().startsWith('jumps:')) {
+        for (final part in line.substring('jumps:'.length).split(',')) {
+          final idx = part.indexOf(':');
+          if (idx < 0) continue;
+          final num = part.substring(0, idx).trim();
+          final other = part.substring(idx + 1).trim().toLowerCase();
+          if (num.isNotEmpty && other.isNotEmpty) {
+            jumps[other] = num;
+          }
+        }
       }
     }
     if (title == null || title.isEmpty) return null;
     links.remove(title);
+    jumps.remove(title);
     final meaning = meaningBuf.toString().trim();
     return WordNode(title,
         links: links,
         x: x,
         y: y,
         color: color,
-        meaning: meaning.isEmpty ? null : meaning);
+        meaning: meaning.isEmpty ? null : meaning,
+        image: image,
+        jumps: jumps);
   }
 
   static Set<String> _parseList(String s) {

@@ -14,11 +14,28 @@ class WordNode {
   /// Hidden definition shown when editing the word. Null/empty = none yet.
   String? meaning;
 
+  /// Picture attached to this node: `http...` URL, `images/<file>` path
+  /// relative to the app folder, or `mem:<key>` session preview.
+  /// Null = plain word bubble.
+  String? image;
+
+  /// Jump-link numbers by neighbor key: a pair sharing a number is
+  /// connected without drawing the long line between them.
+  Map<String, String> jumps;
+
   WordNode(this.name,
-      {Set<String>? links, this.x, this.y, this.color, this.meaning})
-      : links = links ?? <String>{};
+      {Set<String>? links,
+      this.x,
+      this.y,
+      this.color,
+      this.meaning,
+      this.image,
+      Map<String, String>? jumps})
+      : links = links ?? <String>{},
+        jumps = jumps ?? <String, String>{};
 
   bool get hasPos => x != null && y != null;
+  bool get hasImage => image != null && image!.trim().isNotEmpty;
 }
 
 class WordGraph {
@@ -66,9 +83,35 @@ class WordGraph {
   void disconnect(String aRaw, String bRaw) {
     get(aRaw)?.links.remove(norm(bRaw));
     get(bRaw)?.links.remove(norm(aRaw));
+    get(aRaw)?.jumps.remove(norm(bRaw));
+    get(bRaw)?.jumps.remove(norm(aRaw));
   }
 
-  /// Rename a word, keeping its links, position and color.
+  /// Shared jump number for a pair, or null for a solid line.
+  String? jumpNumber(String aRaw, String bRaw) {
+    final a = norm(aRaw);
+    final b = norm(bRaw);
+    return get(a)?.jumps[b] ?? get(b)?.jumps[a];
+  }
+
+  /// Turn the link between two words into a numbered jump (or back to a
+  /// solid line when [number] is null/empty). Creates the link if missing.
+  void setJump(String aRaw, String bRaw, String? number) {
+    final a = norm(aRaw);
+    final b = norm(bRaw);
+    if (a.isEmpty || b.isEmpty || a == b) return;
+    connect(a, b);
+    final num = (number ?? '').trim();
+    if (num.isEmpty) {
+      get(a)?.jumps.remove(b);
+      get(b)?.jumps.remove(a);
+    } else {
+      get(a)?.jumps[b] = num;
+      get(b)?.jumps[a] = num;
+    }
+  }
+
+  /// Rename a word, keeping its links, jump numbers, position and color.
   /// Returns false when the name is taken or invalid.
   bool rename(String oldRaw, String newRaw) {
     final oldKey = norm(oldRaw);
@@ -83,6 +126,8 @@ class WordGraph {
     nodes[newKey] = node;
     for (final n in nodes.values) {
       if (n.links.remove(oldKey)) n.links.add(newKey);
+      final jump = n.jumps.remove(oldKey);
+      if (jump != null) n.jumps[newKey] = jump;
     }
     return true;
   }
@@ -93,6 +138,7 @@ class WordGraph {
     nodes.remove(key);
     for (final n in nodes.values) {
       n.links.remove(key);
+      n.jumps.remove(key);
     }
   }
 

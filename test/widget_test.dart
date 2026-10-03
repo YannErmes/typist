@@ -120,6 +120,37 @@ void main() {
         [(0, 3), (4, 7)]);
   });
 
+  test('jump numbers attach, resolve either way, and clear', () {
+    final g = WordGraph();
+    g.connect('happy', 'exhilarated');
+    expect(g.jumpNumber('happy', 'exhilarated'), isNull);
+    g.setJump('happy', 'exhilarated', '1');
+    expect(g.jumpNumber('happy', 'exhilarated'), '1');
+    expect(g.jumpNumber('exhilarated', 'happy'), '1');
+    expect(g.linked('happy', 'exhilarated'), isTrue);
+    g.setJump('happy', 'exhilarated', null);
+    expect(g.jumpNumber('happy', 'exhilarated'), isNull);
+    expect(g.linked('happy', 'exhilarated'), isTrue);
+    g.setJump('happy', 'exhilarated', '2');
+    g.disconnect('happy', 'exhilarated');
+    expect(g.jumpNumber('happy', 'exhilarated'), isNull);
+  });
+
+  test('word file round-trips image and jumps', () {
+    final node = WordNode('cat',
+        links: {'cute', 'pet'},
+        image: 'images/123.png',
+        jumps: {'cute': '1'});
+    final text = StorageService.serializeWordFile(node);
+    expect(text, contains('image: images/123.png'));
+    expect(text, contains('jumps: 1:cute'));
+    final back = StorageService.parseWordFile(text);
+    expect(back, isNotNull);
+    expect(back!.image, 'images/123.png');
+    expect(back.jumps, {'cute': '1'});
+    expect(back.links, {'cute', 'pet'});
+  });
+
   test('graph renames keeping links, position and color', () {
     final g = WordGraph();
     g.connect('eat', 'orange');
@@ -558,8 +589,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
     final state =
         tester.state<GraphViewState>(find.byType(GraphView).first);
-    // Empty on-screen canvas between the first two bubbles.
-    final at = state.debugToGlobal(const Offset(435, 260));
+    // Empty on-screen canvas, top-left of the cascade area.
+    final at = state.debugToGlobal(const Offset(100, 100));
     final g1 = await tester.startGesture(at);
     await g1.up();
     await tester.pump(const Duration(milliseconds: 60));

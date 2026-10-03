@@ -1,6 +1,10 @@
+import 'dart:io' show File;
 import 'dart:math' as math;
+import 'dart:typed_data' show Uint8List;
 
+import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 
 import 'graph_model.dart';
 import 'storage.dart';
@@ -40,7 +44,9 @@ class GraphView extends StatefulWidget {
 class _Placed {
   final String word;
   Offset center;
-  _Placed(this.word, this.center);
+  double w;
+  double h;
+  _Placed(this.word, this.center, {this.w = 148, this.h = 42});
 }
 
 class _Edge {
@@ -49,7 +55,28 @@ class _Edge {
   final String a;
   final String b;
   final Offset mid; // curve midpoint, for the delete chip + hit-testing
-  _Edge(this.from, this.to, this.a, this.b, this.mid);
+  final String? jump; // numbered jump-link, or null for a solid line
+  _Edge(this.from, this.to, this.a, this.b, this.mid, {this.jump});
+}
+
+const _jumpLabelStyle = TextStyle(
+    color: PaperTheme.ink, fontSize: 11, fontWeight: FontWeight.w700);
+
+/// Pill rect for a jump number, identical for painting and hit-testing.
+RRect _jumpBadgeRect(Offset tip, String label) {
+  final tp = TextPainter(
+    text: TextSpan(text: label, style: _jumpLabelStyle),
+    textDirection: TextDirection.ltr,
+  )..layout();
+  final rect = RRect.fromRectAndRadius(
+    Rect.fromCenter(
+        center: tip,
+        width: tp.width + 16,
+        height: tp.height + 9),
+    const Radius.circular(9),
+  );
+  tp.dispose();
+  return rect;
 }
 
 /// Shared curve math so layout, hit-testing and painting agree.
@@ -81,6 +108,7 @@ Offset _cubicAt(Offset p0, Offset c1, Offset c2, Offset p3, double t) {
 }
 
 double _distToEdge(Offset pt, _Edge e) {
+  if (e.jump != null) return _distToJumpEdge(pt, e);
   final c = _edgeCurve(e.from, e.to);
   var best = double.infinity;
   for (var i = 0; i <= 24; i++) {
@@ -91,11 +119,46 @@ double _distToEdge(Offset pt, _Edge e) {
   return best;
 }
 
+/// Short stub pointing TOWARD the partner word, so each number chip
+/// sits on the side facing its connection (a direction indicator that
+/// swings as bubbles move). Badge tip + direction of travel.
+({Offset tip, Offset dir}) _jumpStub(Offset anchor, Offset partner) {
+  var d = Offset(partner.dx - anchor.dx, partner.dy - anchor.dy);
+  if (d.distance < 1) d = const Offset(0, 1);
+  final dir = d / d.distance;
+  return (tip: anchor + dir * 34, dir: dir);
+}
+
+double _distToSegment(Offset p, Offset a, Offset b) {
+  final abx = b.dx - a.dx;
+  final aby = b.dy - a.dy;
+  final denom = abx * abx + aby * aby;
+  var t = denom <= 0
+      ? 0.0
+      : ((p.dx - a.dx) * abx + (p.dy - a.dy) * aby) / denom;
+  t = t.clamp(0.0, 1.0);
+  return Offset(p.dx - (a.dx + abx * t), p.dy - (a.dy + aby * t))
+      .distance;
+}
+
+double _distToJumpEdge(Offset pt, _Edge e) {
+  var best = double.infinity;
+  for (final ends in [(e.from, e.to), (e.to, e.from)]) {
+    final s = _jumpStub(ends.$1, ends.$2);
+    final dLine = _distToSegment(pt, ends.$1, s.tip);
+    if (dLine < best) best = dLine;
+    final dBadge = (pt - s.tip).distance;
+    if (dBadge < best) best = dBadge;
+  }
+  return best;
+}
+
 /// Bubble footprint plus breathing room, used for overlap checks.
-Rect _nodeRect(Offset c) => Rect.fromCenter(
+Rect _nodeRect(Offset c, [Size s = const Size(148, 42)]) =>
+    Rect.fromCenter(
       center: c,
-      width: GraphViewState._nodeW + 24,
-      height: GraphViewState._nodeH + 30,
+      width: s.width + 24,
+      height: s.height + 30,
     );
 
 class GraphViewState extends State<GraphView> {
@@ -155,12 +218,15 @@ class GraphViewState extends State<GraphView> {
 
   /// Last computed layout, for hit-testing gestures.
   Map<String, Offset> _lastPlaced = {};
+  Map<String, Size> _lastSizes = {};
   List<_Edge> _lastEdges = [];
   Size _lastCanvas = Size.zero;
   final GlobalKey _canvasKey = GlobalKey();
 
   static const double _nodeW = 148;
   static const double _nodeH = 42;
+  static const double _picW = 150;
+  static const double _picH = 118;
   static const double _slotGap = 196;
   static const double _levelGap = 148;
   static const double _margin = 140;
@@ -263,12 +329,42 @@ class GraphViewState extends State<GraphView> {
     _tapDownPt = _toCanvas(global);
   }
 
-  /// Empty-canvas tap: select the nearest link line, or clear the selection.
+  /// Empty-canvas tap: a number chip flies to its group, else select
+  /// the nearest link line, else clear the selection.
   void _canvasTap() {
     final pt = _tapDownPt;
     _tapDownPt = null;
     if (pt == null || _linkMode) return;
     if (_bubbleAt(pt) != null) return; // the bubble's own tap handles it
+    // Number chips first (exact pill shape): fly to the next word
+    // sharing the number.
+    for (final e in _lastEdges) {
+      if (e.jump == null) continue;
+      final sa = _jumpStub(e.from, e.to);
+      if (_jumpBadgeRect(sa.tip, e.jump!)
+          .outerRect
+          .inflate(5)
+          .contains(pt)) {
+        _jumpNavigate(e, e.a);
+        return;
+      }
+      final sb = _jumpStub(e.to, e.from);
+      if (_jumpBadgeRect(sb.tip, e.jump!)
+          .outerRect
+          .inflate(5)
+          .contains(pt)) {
+        _jumpNavigate(e, e.b);
+        return;
+      }
+    }
+    final best = _nearestEdge(pt);
+    setState(() {
+      _selEdge = best == null ? null : (a: best.a, b: best.b);
+    });
+  }
+
+  /// Nearest link line to a canvas point, if close enough to grab.
+  _Edge? _nearestEdge(Offset pt) {
     // Generous, zoom-aware grab radius so lines stay tappable when zoomed out.
     final scale =
         _pan.value.getMaxScaleOnAxis().clamp(0.3, 2.5);
@@ -281,9 +377,67 @@ class GraphViewState extends State<GraphView> {
         best = e;
       }
     }
-    setState(() {
-      _selEdge = best == null ? null : (a: best.a, b: best.b);
-    });
+    return best;
+  }
+
+  /// Fly to the next word carrying [edge]'s jump number, cycling through
+  /// the whole group (1st -> 2nd -> 3rd -> back to 1st).
+  void _jumpNavigate(_Edge edge, String fromWord) {
+    final number = edge.jump;
+    if (number == null) return;
+    final group = <String>[];
+    for (final entry in widget.graph.nodes.entries) {
+      if (entry.value.jumps.values.any((v) => v == number)) {
+        group.add(entry.key);
+      }
+    }
+    group.sort();
+    if (group.isEmpty) return;
+    String next = edge.a == WordGraph.norm(fromWord) ? edge.b : edge.a;
+    final i = group.indexOf(WordGraph.norm(fromWord));
+    if (i >= 0 && group.length > 1) {
+      next = group[(i + 1) % group.length];
+    }
+    _select(next);
+    _pendingCenter = WordGraph.norm(next);
+    setState(() {});
+    _notice('Jump $number shows "$next".');
+  }
+
+  /// Next free jump number (max used + 1, or 1).
+  String _suggestJumpNumber() {
+    var maxN = 0;
+    for (final n in widget.graph.nodes.values) {
+      for (final v in n.jumps.values) {
+        final parsed = int.tryParse(v.trim());
+        if (parsed != null && parsed > maxN) maxN = parsed;
+      }
+    }
+    return '${maxN + 1}';
+  }
+
+  /// Double-clicked a line: turn it into a numbered jump (or renumber).
+  Future<void> _jumpDialog(String a, String b) async {
+    final current = widget.graph.jumpNumber(a, b);
+    final num = await _askWordName(
+      title: current == null
+          ? 'Jump "$a" to "$b"'
+          : 'Jump $current: "$a" to "$b"',
+      hint: 'number, e.g. ${_suggestJumpNumber()}',
+      initial: current,
+      okLabel: 'Make jump',
+    );
+    if (num == null || !mounted) return;
+    widget.graph.setJump(a, b, num);
+    setState(() => _selEdge = (a: a, b: b));
+    await _persist();
+    _notice('Jump $num: connected without a line.');
+  }
+
+  Future<void> _unsjump(String a, String b) async {
+    widget.graph.setJump(a, b, null);
+    await _persist();
+    _notice('Back to a solid line.');
   }
 
   Future<void> _deleteSelectedEdge() async {
@@ -351,12 +505,21 @@ class GraphViewState extends State<GraphView> {
     return box.globalToLocal(global);
   }
 
+  Size _nodeSize(String word) {
+    final n = widget.graph.get(word);
+    if (n != null && n.hasImage) {
+      return const Size(_picW, _picH);
+    }
+    return const Size(_nodeW, _nodeH);
+  }
+
   /// Which bubble contains this canvas point, if any.
   String? _bubbleAt(Offset pt) {
     for (final e in _lastPlaced.entries) {
       final c = e.value;
-      if ((pt.dx - c.dx).abs() <= _nodeW / 2 + 8 &&
-          (pt.dy - c.dy).abs() <= _nodeH / 2 + 8) {
+      final s = _lastSizes[e.key] ?? const Size(_nodeW, _nodeH);
+      if ((pt.dx - c.dx).abs() <= s.width / 2 + 8 &&
+          (pt.dy - c.dy).abs() <= s.height / 2 + 8) {
         return e.key;
       }
     }
@@ -677,6 +840,147 @@ class GraphViewState extends State<GraphView> {
     await _persist();
   }
 
+  /// Add a picture node: behaves like a word (drag, link, delete),
+  /// but shows an image. Source is a local file or a web link.
+  Future<void> _addPicture() async {
+    final src = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF4EEDF),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16)),
+        title: const Text('Picture from…',
+            style: TextStyle(
+                color: PaperTheme.ink,
+                fontSize: 16,
+                fontWeight: FontWeight.w600)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.folder_open,
+                  color: PaperTheme.inkSoft),
+              title: const Text('A file on this device',
+                  style: TextStyle(color: PaperTheme.ink)),
+              onTap: () => Navigator.of(ctx).pop('file'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.link,
+                  color: PaperTheme.inkSoft),
+              title: const Text('A web link',
+                  style: TextStyle(color: PaperTheme.ink)),
+              onTap: () => Navigator.of(ctx).pop('link'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel',
+                style: TextStyle(color: PaperTheme.inkSoft)),
+          ),
+        ],
+      ),
+    );
+    if (src == null || !mounted) return;
+    String? ref;
+    if (src == 'file') {
+      try {
+        final picked = await ImagePicker()
+            .pickImage(source: ImageSource.gallery);
+        if (picked == null) return;
+        if (kIsWeb) {
+          final bytes = await picked.readAsBytes();
+          final key =
+              'mem:${DateTime.now().millisecondsSinceEpoch}';
+          setState(() => _memImages[key] = bytes);
+          ref = key;
+        } else {
+          ref = await widget.storage.importImageFile(picked.path);
+          if (ref == null || !mounted) {
+            _notice('Could not copy that file.');
+            return;
+          }
+        }
+      } catch (_) {
+        if (mounted) _notice('Could not pick that file.');
+        return;
+      }
+    } else {
+      final url = await _askUrl();
+      if (url == null || !mounted) return;
+      ref = url;
+    }
+    final name = await _askWordName(
+        title: 'Name this picture', hint: 'e.g. sunset');
+    if (name == null || !mounted) return;
+    final node = widget.graph.ensure(name);
+    node.image = ref;
+    setState(() => _customPos[name] = _viewCenterCanvas());
+    _select(name, center: true);
+    await _persist();
+    _notice('Picture "$name" on the map — link it like any word.');
+  }
+
+  /// Ask for an image URL (kept verbatim: links are case-sensitive).
+  /// Uses the shared persistent controller (see _nameCtrl docs).
+  Future<String?> _askUrl() async {
+    _nameCtrl.clear();
+    final field = OutlineInputBorder(
+      borderRadius: BorderRadius.circular(12),
+      borderSide: const BorderSide(color: PaperTheme.lineThin),
+    );
+    final url = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFFF4EEDF),
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16)),
+        title: const Text('Image link',
+            style: TextStyle(
+                color: PaperTheme.ink,
+                fontSize: 16,
+                fontWeight: FontWeight.w600)),
+        content: TextField(
+          controller: _nameCtrl,
+          autofocus: true,
+          keyboardType: TextInputType.url,
+          onSubmitted: (_) =>
+              Navigator.of(ctx).pop(_nameCtrl.text.trim()),
+          style:
+              const TextStyle(color: PaperTheme.ink, fontSize: 14),
+          decoration: InputDecoration(
+            hintText: 'https://…',
+            hintStyle: const TextStyle(
+                color: PaperTheme.inkSoft, fontSize: 13),
+            filled: true,
+            fillColor: PaperTheme.surface,
+            border: field,
+            enabledBorder: field,
+            focusedBorder: field,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel',
+                style: TextStyle(color: PaperTheme.inkSoft)),
+          ),
+          TextButton(
+            onPressed: () =>
+                Navigator.of(ctx).pop(_nameCtrl.text.trim()),
+            child: const Text('Use link',
+                style: TextStyle(
+                    color: PaperTheme.ink,
+                    fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (url == null || url.trim().isEmpty) return null;
+    return url.trim();
+  }
+
   /// Canvas point currently at the middle of the viewport.
   Offset _viewCenterCanvas() {
     final s = _pan.value.getMaxScaleOnAxis().clamp(0.3, 2.5);
@@ -711,6 +1015,16 @@ class GraphViewState extends State<GraphView> {
     await _persist();
   }
 
+  /// Keep the word, drop only its picture.
+  Future<void> _removePicture() async {
+    final sel = _selected;
+    final node = sel == null ? null : widget.graph.get(sel);
+    if (node == null) return;
+    node.image = null;
+    await _persist();
+    _notice('Picture removed — "$sel" stays as a word.');
+  }
+
   static const List<int> _palette = [
     0xFFE4DCC7, // paper (default)
     0xFFCBCFAE, // sage
@@ -724,6 +1038,45 @@ class GraphViewState extends State<GraphView> {
     final c = widget.graph.get(word)?.color;
     if (c == null) return const Color(0xFFE4DCC7);
     return Color(c);
+  }
+
+  /// In-memory bytes for web-picked pictures (`mem:` refs).
+  final Map<String, Uint8List> _memImages = {};
+
+  /// Picture for a node, or null for plain word bubbles.
+  Widget? _nodePicture(String word) {
+    final ref = widget.graph.get(word)?.image?.trim();
+    if (ref == null || ref.isEmpty) return null;
+    if (ref.startsWith('http://') || ref.startsWith('https://')) {
+      return Image.network(ref,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) =>
+              _brokenPicture());
+    }
+    if (ref.startsWith('mem:')) {
+      final bytes = _memImages[ref];
+      if (bytes == null) return _brokenPicture();
+      return Image.memory(bytes,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) =>
+              _brokenPicture());
+    }
+    final path = widget.storage.resolveImage(ref);
+    if (path == null) return _brokenPicture();
+    return Image.file(File(path),
+        fit: BoxFit.cover,
+        errorBuilder: (context, error, stackTrace) =>
+            _brokenPicture());
+  }
+
+  Widget _brokenPicture() {
+    return const ColoredBox(
+      color: Color(0xFFD6CDB4),
+      child: Center(
+        child: Icon(Icons.broken_image_outlined,
+            color: PaperTheme.inkSoft),
+      ),
+    );
   }
 
   Future<void> _editMeaning() async {
@@ -840,11 +1193,13 @@ class GraphViewState extends State<GraphView> {
     // layout.
     final placed = <_Placed>[];
     pos.forEach((w, p) {
-      placed.add(_Placed(w, _customPos[w] ?? p));
+      final s = _nodeSize(w);
+      placed.add(_Placed(w, _customPos[w] ?? p, w: s.width, h: s.height));
     });
     for (final e in _customPos.entries) {
       if (g.nodes.containsKey(e.key) && !pos.containsKey(e.key)) {
-        placed.add(_Placed(e.key, e.value));
+        final s = _nodeSize(e.key);
+        placed.add(_Placed(e.key, e.value, w: s.width, h: s.height));
       }
     }
 
@@ -860,19 +1215,22 @@ class GraphViewState extends State<GraphView> {
     final occupied = <Rect>[];
     for (final p in placed) {
       if (p.word == _draggingNode) continue;
-      var r = _nodeRect(p.center);
+      var r = _nodeRect(p.center, Size(p.w, p.h));
       if (!_customPos.containsKey(p.word)) {
         var guard = 0;
         while (occupied.any((o) => o.overlaps(r)) && guard++ < 80) {
           p.center =
               p.center + const Offset(0, GraphViewState._nodeH + 30);
-          r = _nodeRect(p.center);
+          r = _nodeRect(p.center, Size(p.w, p.h));
         }
       }
       occupied.add(r);
     }
 
     final byWord = {for (final p in placed) p.word: p.center};
+    final bySize = {
+      for (final p in placed) p.word: Size(p.w, p.h)
+    };
 
     // One plain link line per connection (undirected, each pair once).
     final edges = <_Edge>[];
@@ -884,27 +1242,30 @@ class GraphViewState extends State<GraphView> {
         if (akey.compareTo(c) >= 0) continue; // draw each pair once
         final to = byWord[c];
         if (to == null) continue;
+        final sa = bySize[akey] ?? const Size(_nodeW, _nodeH);
+        final sb = bySize[c] ?? const Size(_nodeW, _nodeH);
         // Anchor on facing sides so lines leave bubbles cleanly.
         final bool sideBySide =
             (to.dx - from.dx).abs() >= (to.dy - from.dy).abs();
         final Offset f;
         final Offset t;
         if (sideBySide && to.dx >= from.dx) {
-          f = Offset(from.dx + _nodeW / 2, from.dy);
-          t = Offset(to.dx - _nodeW / 2, to.dy);
+          f = Offset(from.dx + sa.width / 2, from.dy);
+          t = Offset(to.dx - sb.width / 2, to.dy);
         } else if (sideBySide) {
-          f = Offset(from.dx - _nodeW / 2, from.dy);
-          t = Offset(to.dx + _nodeW / 2, to.dy);
+          f = Offset(from.dx - sa.width / 2, from.dy);
+          t = Offset(to.dx + sb.width / 2, to.dy);
         } else if (to.dy >= from.dy) {
-          f = Offset(from.dx, from.dy + _nodeH / 2);
-          t = Offset(to.dx, to.dy - _nodeH / 2);
+          f = Offset(from.dx, from.dy + sa.height / 2);
+          t = Offset(to.dx, to.dy - sb.height / 2);
         } else {
-          f = Offset(from.dx, from.dy - _nodeH / 2);
-          t = Offset(to.dx, to.dy + _nodeH / 2);
+          f = Offset(from.dx, from.dy - sa.height / 2);
+          t = Offset(to.dx, to.dy + sb.height / 2);
         }
         final curve = _edgeCurve(f, t);
-        edges.add(_Edge(
-            f, t, akey, c, _cubicAt(f, curve.c1, curve.c2, t, 0.5)));
+        edges.add(_Edge(f, t, akey, c,
+            _cubicAt(f, curve.c1, curve.c2, t, 0.5),
+            jump: g.jumpNumber(akey, c)));
       }
     }
 
@@ -925,6 +1286,9 @@ class GraphViewState extends State<GraphView> {
     final sel = _selected != null ? widget.graph.get(_selected!) : null;
     final laid = _layoutAll();
     _lastPlaced = {for (final p in laid.placed) p.word: p.center};
+    _lastSizes = {
+      for (final p in laid.placed) p.word: Size(p.w, p.h)
+    };
     _lastEdges = laid.edges;
     _lastCanvas = laid.canvas;
     final shown = _filteredKeys();
@@ -1014,6 +1378,14 @@ class GraphViewState extends State<GraphView> {
                         },
                         icon: const Icon(Icons.add,
                             size: 18, color: PaperTheme.ink),
+                      ),
+                      IconButton(
+                        tooltip: 'Add a picture node',
+                        onPressed: _addPicture,
+                        icon: const Icon(
+                            Icons.image_outlined,
+                            size: 18,
+                            color: PaperTheme.inkSoft),
                       ),
                     ],
                   ),
@@ -1182,6 +1554,20 @@ class GraphViewState extends State<GraphView> {
                               size: 17,
                               color: PaperTheme.inkSoft),
                         ),
+                        if (sel.hasImage)
+                          TextButton.icon(
+                            onPressed: _removePicture,
+                            icon: const Icon(
+                                Icons.hide_image_outlined,
+                                size: 15,
+                                color: PaperTheme.inkSoft),
+                            label: const Text(
+                              'Remove picture',
+                              style: TextStyle(
+                                  color: PaperTheme.inkSoft,
+                                  fontSize: 12),
+                            ),
+                          ),
                       ],
                     ),
                     const SizedBox(height: 6),
@@ -1256,6 +1642,11 @@ class GraphViewState extends State<GraphView> {
                                               null) {
                                             return; // the bubble handles it
                                           }
+                                          final e = _nearestEdge(pt);
+                                          if (e != null) {
+                                            _jumpDialog(e.a, e.b);
+                                            return;
+                                          }
                                           _newWordAt(pt);
                                         },
                                         child: Container(
@@ -1277,7 +1668,8 @@ class GraphViewState extends State<GraphView> {
                                             selB: _selEdge?.b),
                                       ),
                                     ),
-                                    // Delete chip on the selected link.
+                                    // Chip on the selected link: delete it,
+                                    // or turn a jump back into a line.
                                     if (_selEdge != null)
                                       for (final e in laid.edges)
                                         if ((e.a == _selEdge!.a &&
@@ -1285,11 +1677,11 @@ class GraphViewState extends State<GraphView> {
                                             (e.a == _selEdge!.b &&
                                                 e.b == _selEdge!.a))
                                           Positioned(
-                                            left: (e.mid.dx - 78)
+                                            left: (e.mid.dx - 95)
                                                 .clamp(
                                                     8.0,
                                                     (laid.canvas.width -
-                                                            164)
+                                                            198)
                                                         .clamp(
                                                             8.0, 1e6)),
                                             top: (e.mid.dy - 52)
@@ -1298,14 +1690,14 @@ class GraphViewState extends State<GraphView> {
                                               onTap:
                                                   _deleteSelectedEdge,
                                               child: Container(
-                                                width: 156,
+                                                width: 190,
                                                 padding:
                                                     const EdgeInsets
                                                         .symmetric(
                                                             horizontal:
-                                                                10,
+                                                                6,
                                                             vertical:
-                                                                6),
+                                                                4),
                                                 decoration:
                                                     BoxDecoration(
                                                   color:
@@ -1338,25 +1730,68 @@ class GraphViewState extends State<GraphView> {
                                                   children: [
                                                     Expanded(
                                                       child: Text(
-                                                        'Delete this link?',
+                                                        e.jump == null
+                                                            ? 'Delete this link?'
+                                                            : 'Jump ${e.jump}',
                                                         style:
                                                             const TextStyle(
                                                           color: PaperTheme
                                                               .ink,
                                                           fontSize:
                                                               11,
+                                                          fontWeight:
+                                                              FontWeight
+                                                                  .w600,
                                                         ),
                                                         overflow:
                                                             TextOverflow
                                                                 .ellipsis,
                                                       ),
                                                     ),
-                                                    const Icon(
-                                                        Icons
-                                                            .delete_outline,
-                                                        size: 14,
-                                                        color: PaperTheme
-                                                            .ink),
+                                                    if (e.jump != null)
+                                                      InkWell(
+                                                        onTap: () =>
+                                                            _unsjump(
+                                                                e.a,
+                                                                e.b),
+                                                        borderRadius:
+                                                            BorderRadius
+                                                                .circular(
+                                                                    8),
+                                                        child:
+                                                            const Padding(
+                                                          padding: EdgeInsets
+                                                              .symmetric(
+                                                                  horizontal:
+                                                                      6,
+                                                                  vertical:
+                                                                      4),
+                                                          child: Text(
+                                                            'line',
+                                                            style:
+                                                                TextStyle(
+                                                              color: PaperTheme
+                                                                  .inkSoft,
+                                                              fontSize:
+                                                                  11,
+                                                              decoration:
+                                                                  TextDecoration
+                                                                      .underline,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    const Padding(
+                                                      padding:
+                                                          EdgeInsets.all(
+                                                              4),
+                                                      child: Icon(
+                                                          Icons
+                                                              .delete_outline,
+                                                          size: 14,
+                                                          color: PaperTheme
+                                                              .ink),
+                                                    ),
                                                   ],
                                                 ),
                                               ),
@@ -1364,10 +1799,8 @@ class GraphViewState extends State<GraphView> {
                                           ),
                                     for (final p in laid.placed)
                                       Positioned(
-                                        left: p.center.dx -
-                                            _nodeW / 2,
-                                        top: p.center.dy -
-                                            _nodeH / 2,
+                                        left: p.center.dx - p.w / 2,
+                                        top: p.center.dy - p.h / 2,
                                         child: GestureDetector(
                                           // Taps select / drill; all dragging
                                           // is driven by the canvas pointer
@@ -1386,6 +1819,8 @@ class GraphViewState extends State<GraphView> {
                                                 _linkMode &&
                                                     _linkFrom ==
                                                         p.word,
+                                            picture:
+                                                _nodePicture(p.word),
                                           ),
                                         ),
                                       ),
@@ -1614,20 +2049,69 @@ class _MiniField extends StatelessWidget {
   }
 }
 
-/// Soft rounded mind-map bubble.
+/// Soft rounded mind-map bubble (or picture card).
 class _MapNode extends StatelessWidget {
   final String word;
   final Color fill;
   final bool isCenter;
   final bool linkSource;
+  final Widget? picture;
   const _MapNode(
       {required this.word,
       required this.fill,
       required this.isCenter,
-      this.linkSource = false});
+      this.linkSource = false,
+      this.picture});
 
   @override
   Widget build(BuildContext context) {
+    final pic = picture;
+    if (pic != null) {
+      return Container(
+        width: GraphViewState._picW,
+        height: GraphViewState._picH,
+        decoration: BoxDecoration(
+          color: fill,
+          border: Border.all(
+              color: (isCenter || linkSource)
+                  ? PaperTheme.inkSoft
+                  : PaperTheme.lineThin,
+              width: (isCenter || linkSource) ? 1.6 : 1),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF3E3A31).withValues(alpha: 0.10),
+              blurRadius: 6,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(13)),
+                child: SizedBox.expand(child: pic),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 8, vertical: 5),
+              child: Text(
+                word,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: PaperTheme.ink,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
     return Container(
       width: GraphViewState._nodeW,
       height: GraphViewState._nodeH,
@@ -1690,6 +2174,11 @@ class _BranchPainter extends CustomPainter {
     for (final e in edges) {
       final selected = (e.a == selA && e.b == selB) ||
           (e.a == selB && e.b == selA);
+      if (e.jump != null) {
+        _paintStub(canvas, e.from, e.to, e.jump!, selected);
+        _paintStub(canvas, e.to, e.from, e.jump!, selected);
+        continue;
+      }
       final paint = selected
           ? (Paint()
             ..color = PaperTheme.ink
@@ -1719,6 +2208,39 @@ class _BranchPainter extends CustomPainter {
       canvas.drawCircle(
           tt, 3.2, Paint()..color = PaperTheme.ink);
     }
+  }
+
+  void _paintStub(Canvas canvas, Offset anchor, Offset partner,
+      String label, bool selected) {
+    final s = _jumpStub(anchor, partner);
+    canvas.drawLine(
+        anchor,
+        s.tip,
+        Paint()
+          ..color = selected ? PaperTheme.ink : PaperTheme.line
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = selected ? 2.2 : 1.4
+          ..strokeCap = StrokeCap.round);
+    final rect = _jumpBadgeRect(s.tip, label);
+    canvas.drawRRect(
+        rect,
+        Paint()
+          ..color = selected
+              ? PaperTheme.chip
+              : const Color(0xFFF4EEDF));
+    canvas.drawRRect(
+        rect,
+        Paint()
+          ..color = selected ? PaperTheme.ink : PaperTheme.line
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.2);
+    final tp = TextPainter(
+      text: TextSpan(text: label, style: _jumpLabelStyle),
+      textDirection: TextDirection.ltr,
+    )..layout();
+    tp.paint(canvas,
+        Offset(s.tip.dx - tp.width / 2, s.tip.dy - tp.height / 2));
+    tp.dispose();
   }
 
   @override
