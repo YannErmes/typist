@@ -8,6 +8,7 @@ import 'package:flutter/services.dart'
         ClipboardData,
         SelectionChangedCause,
         rootBundle;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:spell_check_on_client/spell_check_on_client.dart';
 import 'package:flutter_quill/flutter_quill.dart'
     show
@@ -29,6 +30,7 @@ import 'package:flutter_quill/flutter_quill.dart'
 import 'package:flutter_quill_extensions/flutter_quill_extensions.dart';
 
 import 'ai_service.dart';
+import 'grammar_check.dart';
 import 'graph_model.dart';
 import 'storage.dart';
 import 'tag_sheet.dart';
@@ -99,6 +101,9 @@ int countWords(String text) {  return RegExp(r"[\p{L}\p{N}]+(?:'[\p{L}\p{N}]+)?"
 
 /// Fill flagging possible typos (offline dictionary).
 const String _spellHex = '#ffdfb0';
+
+/// Fill flagging passages a checked grammar structure could fit.
+const String _grammarHex = '#d7e5f7';
 
 /// Ranges of likely-misspelled words. Skips the word under [cursor]
 /// (still being typed), tokens without letters, and bits of links/tags.
@@ -203,11 +208,11 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   bool _aiOpen = false;
   final TextEditingController _aiQ = TextEditingController();
   final TextEditingController _aiKeyField = TextEditingController();
-  MistralClient _aiClient = MistralClient();
+  GroqClient _aiClient = GroqClient();
 
   /// Test hook: swap the network client for a fake.
   @visibleForTesting
-  void debugSetAiClient(MistralClient client) {
+  void debugSetAiClient(GroqClient client) {
     _aiClient.dispose();
     _aiClient = client;
   }
@@ -1280,6 +1285,224 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _notice(notice);
   }
 
+  /// Grammar check state.
+  bool _grammarBusy = false;
+
+  /// Resolved grammar flags from the last check (quote + sentence).
+  List<({String quote, String sentence, String category, int start})>
+      _grammarFlags = [];
+
+  /// Run the AI grammar check against the checked reference sentences.
+  /// Marks matching passages blue and lists which structure each fits.
+  /// Never rewrites or suggests rephrasings.
+  Future<void> _runGrammarCheck() async {
+    if (_grammarBusy || !_loaded) return;
+    List<GrammarItem> checked = [];
+    try {
+      final all = await widget.storage.loadGrammar();
+      checked = [for (final g in all) if (g.checked) g];
+    } catch (_) {}
+    if (!mounted) return;
+    if (checked.isEmpty) {
+      _notice('Check some sentences on the Grammar page first.');
+      return;
+    }
+    String text;
+    try {
+      text = _quill.document.toPlainText();
+    } catch (_) {
+      return;
+    }
+    if (text.trim().isEmpty) {
+      _notice('Write something first.');
+      return;
+    }
+    final key = await widget.storage.loadAiKey();
+    if (!mounted) return;
+    if (key.isEmpty) {
+      _notice('Add your Groq key via @ai first.');
+      return;
+    }
+    setState(() => _grammarBusy = true);
+    try {
+      final prompt = buildGrammarPrompt(text, checked);
+      final answer = await _aiClient.ask(key, prompt);
+      if (!mounted) return;
+      final flags = parseGrammarFlags(answer);
+      final resolved = <({String quote, String sentence, String category, int start})>[];
+      for (final f in flags) {
+        final ref = resolveGrammarFlag(f, checked);
+        if (ref == null) continue;
+        final at = text.indexOf(f.quote);
+        if (at < 0) continue;
+        resolved.add((
+          quote: f.quote,
+          sentence: ref.sentence,
+          category: ref.category,
+          start: at,
+        ));
+      }
+      // Paint the found passages; lift only our previous grammar paint.
+      _applyingHighlight = true;
+      try {
+        final current = _currentMarks({
+          ..._managedHexes(widget.graph),
+          _spellHex,
+          _grammarHex,
+        });
+        bool covers(List<(int, int)> list, int s, int e) {
+          for (final r in list) {
+            if (r.$1 <= s && r.$2 >= e) return true;
+          }
+          return false;
+        }
+
+        final wanted = [
+          for (final r in resolved) (r.start, r.start + r.quote.length)
+        ];
+        for (final r in current.green) {
+          if (r.hex == _grammarHex && !covers(wanted, r.start, r.end)) {
+            _quill.formatText(
+                r.start, r.end - r.start, const BackgroundAttribute(null));
+          }
+        }
+        for (final r in wanted) {
+          if (!covers(
+              [for (final g in current.green) (g.start, g.end)],
+              r.$1,
+              r.$2)) {
+            _quill.formatText(r.$1, r.$2 - r.$1,
+                const BackgroundAttribute(_grammarHex));
+          }
+        }
+      } catch (_) {
+      } finally {
+        _applyingHighlight = false;
+      }
+      setState(() {
+        _grammarBusy = false;
+        _grammarFlags = resolved;
+      });
+      _showGrammarResults(answer);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _grammarBusy = false);
+      _notice(e.toString());
+    }
+  }
+
+  void _showGrammarResults(String rawAnswer) {
+    final flags = List.of(_grammarFlags);
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => Container(
+        decoration: const BoxDecoration(
+          color: PaperTheme.paper,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        ),
+        padding:
+            const EdgeInsets.fromLTRB(18, 10, 18, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: PaperTheme.line,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              flags.isEmpty
+                  ? 'No matching passages found'
+                  : '${flags.length} ${flags.length == 1 ? 'passage' : 'passages'} to look at',
+              style: const TextStyle(
+                  color: PaperTheme.ink,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Only the matching structure is named — nothing rewritten.',
+              style: TextStyle(
+                  color: PaperTheme.inkSoft, fontSize: 11),
+            ),
+            const SizedBox(height: 8),
+            Flexible(
+              child: flags.isEmpty
+                  ? SingleChildScrollView(
+                      child: Text(
+                        rawAnswer.length > 1200
+                            ? rawAnswer.substring(0, 1200)
+                            : rawAnswer,
+                        style: const TextStyle(
+                            color: PaperTheme.inkSoft,
+                            fontSize: 12),
+                      ),
+                    )
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: flags.length,
+                      itemBuilder: (context, i) {
+                        final f = flags[i];
+                        return InkWell(
+                          onTap: () {
+                            Navigator.of(ctx).pop();
+                            try {
+                              _quill.moveCursorToPosition(f.start);
+                            } catch (_) {}
+                            _focusNode.requestFocus();
+                          },
+                          borderRadius: BorderRadius.circular(10),
+                          child: Container(
+                            margin: const EdgeInsets.symmetric(
+                                vertical: 4),
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFEFE8D6),
+                              border: Border.all(
+                                  color: PaperTheme.lineThin),
+                              borderRadius:
+                                  BorderRadius.circular(10),
+                            ),
+                            child: Column(
+                              crossAxisAlignment:
+                                  CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '“…${f.quote}…”',
+                                  style: const TextStyle(
+                                      color: PaperTheme.ink,
+                                      fontSize: 13,
+                                      fontStyle:
+                                          FontStyle.italic),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  'fits: [${f.category}] ${f.sentence}',
+                                  style: const TextStyle(
+                                      color: PaperTheme.inkSoft,
+                                      fontSize: 11),
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _notice(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -1481,7 +1704,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _aiError = '';
     _refreshAiCard();
     if (key.isEmpty) {
-      _aiError = 'Paste your Mistral API key first.';
+      _aiError = 'Paste your Groq API key first.';
       _refreshAiCard();
       return;
     }
@@ -1637,7 +1860,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                 children: [
                   const Expanded(
                     child: Text(
-                      'Ask Mistral',
+                      'Ask Groq',
                       style: TextStyle(
                         color: PaperTheme.inkSoft,
                         fontSize: 11,
@@ -1666,11 +1889,34 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
                     if (!hasKey || _editingKey) ...[
-                      const Text(
-                        'Paste your Mistral API key. It stays on this device.',
-                        style: TextStyle(
-                            color: PaperTheme.inkSoft,
-                            fontSize: 11),
+                      Row(
+                        children: [
+                          const Expanded(
+                            child: Text(
+                              'Paste your Groq API key. It stays on this device.',
+                              style: TextStyle(
+                                  color: PaperTheme.inkSoft,
+                                  fontSize: 11),
+                            ),
+                          ),
+                          InkWell(
+                            onTap: () => launchUrl(
+                                Uri.parse(
+                                    'https://console.groq.com/keys'),
+                                mode: LaunchMode
+                                    .externalApplication),
+                            child: const Padding(
+                              padding: EdgeInsets.all(4),
+                              child: Text('get one',
+                                  style: TextStyle(
+                                      color:
+                                          PaperTheme.inkSoft,
+                                      fontSize: 10,
+                                      decoration: TextDecoration
+                                          .underline)),
+                            ),
+                          ),
+                        ],
                       ),
                       const SizedBox(height: 6),
                       TextField(
@@ -1680,7 +1926,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                         style: const TextStyle(
                             color: PaperTheme.ink, fontSize: 12),
                         decoration: InputDecoration(
-                          hintText: 'mistral key…',
+                          hintText: 'groq key…',
                           hintStyle: const TextStyle(
                               color: PaperTheme.inkSoft,
                               fontSize: 11),
@@ -2260,6 +2506,56 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                 children: [
                                   _sigilButton('@', 'mention',
                                       _onAtButton),
+                                  const SizedBox(width: 8),
+                                  InkWell(
+                                    onTap: _grammarBusy
+                                        ? null
+                                        : _runGrammarCheck,
+                                    borderRadius:
+                                        BorderRadius.circular(14),
+                                    child: Container(
+                                      padding:
+                                          const EdgeInsets.symmetric(
+                                              horizontal: 12,
+                                              vertical: 5),
+                                      decoration: BoxDecoration(
+                                        color: PaperTheme.surface,
+                                        border: Border.all(
+                                            color:
+                                                PaperTheme.lineThin),
+                                        borderRadius:
+                                            BorderRadius.circular(14),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (_grammarBusy)
+                                            const SizedBox(
+                                              width: 11,
+                                              height: 11,
+                                              child:
+                                                  CircularProgressIndicator(
+                                                      strokeWidth: 2),
+                                            )
+                                          else
+                                            const Icon(
+                                                Icons.spellcheck,
+                                                size: 14,
+                                                color:
+                                                    PaperTheme.ink),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                              _grammarBusy
+                                                  ? 'checking…'
+                                                  : 'grammar check',
+                                              style: const TextStyle(
+                                                  color: PaperTheme
+                                                      .inkSoft,
+                                                  fontSize: 10.5)),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
                                   const SizedBox(width: 8),
                                   const Expanded(
                                     child: Text(

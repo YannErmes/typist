@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:spell_check_on_client/spell_check_on_client.dart';
 import 'package:word_graph_tool/ai_service.dart';
+import 'package:word_graph_tool/grammar_check.dart';
 import 'package:word_graph_tool/graph_model.dart';
 import 'package:word_graph_tool/graph_view.dart';
 import 'package:word_graph_tool/main.dart';
@@ -21,44 +22,100 @@ import 'package:word_graph_tool/storage.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
 
 void main() {
-  test('mistral request is well-formed', () {
+  test('grammar prompt carries checked structures and strict rules', () {
+    final items = [
+      GrammarItem(
+          id: 'a', text: 'If I had known, I would have come.',
+          category: 'Conditionals'),
+      GrammarItem(
+          id: 'b', text: 'She has lived here since 2010.',
+          category: 'Tenses', checked: false),
+    ];
+    final checked = [for (final i in items) if (i.checked) i];
+    final prompt = buildGrammarPrompt('I wish I know.', checked);
+    expect(prompt, contains('[S1] (Conditionals)'));
+    expect(prompt, contains('If I had known'));
+    expect(prompt, isNot(contains('She has lived')));
+    expect(prompt, contains('Do NOT rewrite'));
+    expect(prompt, contains('Do NOT suggest rephrasings'));
+  });
+
+  test('grammar flags parse leniently, resolve strictly', () {
+    const body = '''
+[{"quote": "I wish I know", "structure": "S1"},
+ {"quote": "oops", "structure": "S9"},
+ {"quote": "", "structure": "S1"},
+ {"nope": true}]
+[] tail''';
+    final flags = parseGrammarFlags(body);
+    expect(flags.length, 2);
+    expect(parseGrammarFlags('nothing matches really'), isEmpty);
+    expect(parseGrammarFlags('[]'), isEmpty);
+    final items = [
+      GrammarItem(id: 'a', text: 'If I had known.', category: 'Cond')
+    ];
+    final ok = resolveGrammarFlag(flags.first, items);
+    expect(ok, isNotNull);
+    expect(ok!.category, 'Cond');
+    expect(resolveGrammarFlag(flags[1], items), isNull);
+  });
+
+  test('grammar items save and reload with checks intact', () async {
+    final s = StorageService();
+    await s.init(); // falls back to in-memory when no folder exists
+    await s.saveGrammar([
+      GrammarItem(
+          id: 'a', text: 'If I had known.', category: 'Conditionals'),
+      GrammarItem(
+          id: 'b', text: 'Had I known.', category: 'Conditionals',
+          checked: false),
+    ]);
+    final back = await s.loadGrammar();
+    expect(back.length, 2);
+    expect(back.first.text, 'If I had known.');
+    expect(back.first.checked, isTrue);
+    expect(back[1].checked, isFalse);
+    expect(back[1].category, 'Conditionals');
+  });
+
+  test('groq request is well-formed', () {
     final req = buildChatRequest('a better word for happy?');
-    expect(req['model'], MistralClient.model);
+    expect(req['model'], GroqClient.model);
     final messages = req['messages'] as List;
     expect(messages.length, 2);
     expect((messages.last as Map)['content'],
         'a better word for happy?');
   });
 
-  test('mistral answer parses, errors stay friendly', () {
+  test('groq answer parses, errors stay friendly', () {
     const body =
         '{"choices":[{"message":{"content":"  delighted  "}}]}';
     expect(parseChatAnswer(body), 'delighted');
     expect(
-        MistralException.friendly(401, '{}').toString(),
+        GroqException.friendly(401, '{}').toString(),
         contains('401'));
     expect(
-        MistralException.friendly(429, '{}').toString(),
+        GroqException.friendly(429, '{}').toString(),
         contains('429'));
     expect(
-        MistralException.friendly(500, '{"message":"boom"}')
+        GroqException.friendly(500, '{"message":"boom"}')
             .toString(),
         contains('boom'));
   });
 
-  test('mistral ask works through a fake client', () async {
-    final client = MistralClient(
+  test('groq ask works through a fake client', () async {
+    final client = GroqClient(
       client: MockClient((request) async {
         expect(request.headers['Authorization'],
             'Bearer test-key');
-        expect(request.url.host, 'api.mistral.ai');
+        expect(request.url.host, 'api.groq.com');
         return http.Response(
             '{"choices":[{"message":{"content":"joyful"}}]}',
             200);
       }),
     );
     expect(await client.ask('test-key', 'hi'), 'joyful');
-    final bad = MistralClient(
+    final bad = GroqClient(
       client: MockClient((_) async =>
           http.Response('{"message":"nope"}', 401)),
     );
@@ -281,7 +338,7 @@ void main() {
         .typeForTest('@ai');
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(const Duration(milliseconds: 500));
-    expect(find.text('Ask Mistral'), findsOneWidget);
+    expect(find.text('Ask Groq'), findsOneWidget);
     // The @ai token is consumed like a slash command.
     final sheetState =
         tester.state<SheetViewState>(find.byType(SheetView));
@@ -299,7 +356,7 @@ void main() {
     await tester.pump(const Duration(milliseconds: 500));
     expect(find.textContaining('what better word'), findsOneWidget);
     // Ask through a fake backend: the answer must appear in the card.
-    sheetState.debugSetAiClient(MistralClient(
+    sheetState.debugSetAiClient(GroqClient(
       client: MockClient((_) async => http.Response(
           '{"choices":[{"message":{"content":"joyful"}}]}', 200)),
     ));
@@ -321,7 +378,7 @@ void main() {
     // Close the chat; nothing was saved anywhere.
     await tester.tap(find.byIcon(Icons.close).last);
     await tester.pump(const Duration(milliseconds: 500));
-    expect(find.text('Ask Mistral'), findsNothing);
+    expect(find.text('Ask Groq'), findsNothing);
   });
 
   testWidgets('@ mention inserts the word and pops its map',
@@ -676,6 +733,35 @@ void main() {
     await tester.pump(const Duration(seconds: 1));
   });
 
+  testWidgets('grammar page adds and groups a sentence',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('Grammar'));
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(find.textContaining('Grammar structures'), findsOneWidget);
+    await tester.enterText(
+        find.byWidgetPredicate((w) =>
+            w is TextField &&
+            (w.decoration?.hintText ?? '').startsWith('Paste a sentence')),
+        'If I had known, I would have come.');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.enterText(
+        find.byWidgetPredicate((w) =>
+            w is TextField &&
+            (w.decoration?.hintText ?? '').startsWith('Category')),
+        'Conditionals');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Add'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('If I had known, I would have come.'),
+        findsOneWidget);
+    expect(find.text('Conditionals (1)'), findsOneWidget);
+  });
+
   testWidgets('app boots to sheet view', (WidgetTester tester) async {
     await tester.pumpWidget(const WordGraphToolApp());
     await tester.pump(const Duration(seconds: 5));
@@ -684,3 +770,5 @@ void main() {
     expect(find.text('Word Graph Tool'), findsOneWidget);
   });
 }
+
+

@@ -16,6 +16,43 @@ class WritingSession {
       {this.folder = 'Notes'});
 }
 
+/// One reference sentence on the grammar page.
+class GrammarItem {
+  final String id;
+  String text;
+  String category;
+  bool checked;
+  GrammarItem({
+    required this.id,
+    required this.text,
+    this.category = 'General',
+    this.checked = true,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'text': text,
+        'category': category,
+        'checked': checked,
+      };
+
+  static GrammarItem? fromJson(dynamic raw) {
+    if (raw is! Map) return null;
+    final text = (raw['text'] ?? '').toString().trim();
+    if (text.isEmpty) return null;
+    final category =
+        (raw['category'] ?? 'General').toString().trim();
+    return GrammarItem(
+      id: (raw['id'] ?? '').toString().isEmpty
+          ? '${DateTime.now().millisecondsSinceEpoch}'
+          : (raw['id']).toString(),
+      text: text,
+      category: category.isEmpty ? 'General' : category,
+      checked: raw['checked'] != false,
+    );
+  }
+}
+
 /// All persistence is local files, written silently with dart:io.
 /// Layout: [Documents]/WordGraphTool/`sheets/<id>.json` (titled sessions
 /// with Quill delta content) + words per-word .md files.
@@ -138,13 +175,13 @@ class StorageService {
     }
   }
 
-  // ---- Mistral API key (user-supplied, never shipped) ----
+  // ---- Groq API key (user-supplied, never shipped) ----
   String _memoryAiKey = '';
 
   File? get _aiKeyFile => _base == null
       ? null
       : File(
-          '${_base!.path}${Platform.pathSeparator}mistral_key.txt');
+          '${_base!.path}${Platform.pathSeparator}groq_key.txt');
 
   Future<String> loadAiKey() async {
     final file = _aiKeyFile;
@@ -172,6 +209,48 @@ class StorageService {
   }
   List<String> _memoryFolders = [];
   List<String> _memoryLearned = [];
+  List<Map<String, dynamic>> _memoryGrammar = [];
+
+  File? get _grammarFile => _base == null
+      ? null
+      : File(
+          '${_base!.path}${Platform.pathSeparator}grammar.json');
+
+  /// Grammar reference sentences, in saved order.
+  Future<List<GrammarItem>> loadGrammar() async {
+    List<dynamic> raw;
+    if (_grammarFile == null) {
+      raw = _memoryGrammar;
+    } else {
+      try {
+        final file = _grammarFile!;
+        if (!await file.exists()) return [];
+        raw = jsonDecode(await file.readAsString()) as List;
+      } catch (_) {
+        return [];
+      }
+    }
+    final out = <GrammarItem>[];
+    for (final e in raw) {
+      final item = GrammarItem.fromJson(e);
+      if (item != null) out.add(item);
+    }
+    return out;
+  }
+
+  Future<void> saveGrammar(List<GrammarItem> items) async {
+    final raw = [for (final i in items) i.toJson()];
+    if (_grammarFile == null) {
+      _memoryGrammar =
+          raw.map((e) => Map<String, dynamic>.of(e)).toList();
+      return;
+    }
+    try {
+      await _grammarFile!.writeAsString(jsonEncode(raw));
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
+  }
 
   File? get _foldersFile => _base == null
       ? null

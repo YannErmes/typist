@@ -6,6 +6,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 
 import 'forbidden_view.dart';
+import 'grammar_view.dart';
 import 'graph_model.dart';
 import 'graph_view.dart';
 import 'sheet_view.dart';
@@ -120,6 +121,27 @@ class _HomeShellState extends State<HomeShell> {
     _sheetKey.currentState?.refreshGraph();
   }
 
+  Widget _tabButton(int index, IconData icon, String label) {
+    final active = _tab == index;
+    return TextButton.icon(
+      onPressed: () => setState(() => _tab = index),
+      style: TextButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 6),
+        minimumSize: const Size(0, 36),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      icon: Icon(icon,
+          size: 18,
+          color: active ? PaperTheme.ink : PaperTheme.inkSoft),
+      label: Text(label,
+          style: TextStyle(
+              fontSize: 13,
+              color: active ? PaperTheme.ink : PaperTheme.inkSoft,
+              fontWeight:
+                  active ? FontWeight.w700 : FontWeight.normal)),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -133,46 +155,28 @@ class _HomeShellState extends State<HomeShell> {
                   width: 28, height: 28),
             ),
             const SizedBox(width: 10),
-            const Text('Word Graph Tool',
-                style:
-                    TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const Flexible(
+              child: Text('Word Graph Tool',
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w600)),
+            ),
           ],
         ),
         actions: [
-          TextButton.icon(
-            onPressed: () => setState(() => _tab = 0),
-            icon: Icon(Icons.edit_note,
-                color: _tab == 0 ? PaperTheme.ink : PaperTheme.inkSoft),
-            label: Text('Sheet',
-                style: TextStyle(
-                    color:
-                        _tab == 0 ? PaperTheme.ink : PaperTheme.inkSoft,
-                    fontWeight:
-                        _tab == 0 ? FontWeight.w700 : FontWeight.normal)),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                _tabButton(0, Icons.edit_note, 'Sheet'),
+                _tabButton(1, Icons.account_tree, 'Graph'),
+                _tabButton(2, Icons.block, 'Banned'),
+                _tabButton(3, Icons.spellcheck, 'Grammar'),
+                const SizedBox(width: 12),
+              ],
+            ),
           ),
-          TextButton.icon(
-            onPressed: () => setState(() => _tab = 1),
-            icon: Icon(Icons.account_tree,
-                color: _tab == 1 ? PaperTheme.ink : PaperTheme.inkSoft),
-            label: Text('Graph',
-                style: TextStyle(
-                    color:
-                        _tab == 1 ? PaperTheme.ink : PaperTheme.inkSoft,
-                    fontWeight:
-                        _tab == 1 ? FontWeight.w700 : FontWeight.normal)),
-          ),
-          TextButton.icon(
-            onPressed: () => setState(() => _tab = 2),
-            icon: Icon(Icons.block,
-                color: _tab == 2 ? PaperTheme.ink : PaperTheme.inkSoft),
-            label: Text('Banned',
-                style: TextStyle(
-                    color:
-                        _tab == 2 ? PaperTheme.ink : PaperTheme.inkSoft,
-                    fontWeight:
-                        _tab == 2 ? FontWeight.w700 : FontWeight.normal)),
-          ),
-          const SizedBox(width: 12),
         ],
       ),
       body: !_ready
@@ -203,6 +207,9 @@ class _HomeShellState extends State<HomeShell> {
                 ForbiddenPage(
                   storage: _storage,
                   words: _forbidden,
+                ),
+                GrammarPage(
+                  storage: _storage,
                 ),
               ],
             ),
