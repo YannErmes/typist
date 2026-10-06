@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import 'graph_model.dart';
+import 'repetition_logic.dart';
 import 'storage.dart';
 import 'theme.dart';
 
@@ -176,7 +177,14 @@ class GraphViewState extends State<GraphView> {
   /// dialog controller while its route animates out trips rebuilds that
   /// still reference it (red screen). Disposed once with this state.
   final TextEditingController _nameCtrl = TextEditingController();
-  final TransformationController _pan = TransformationController();
+
+  /// Same deal for the repetition interval dialog's number field.
+  final TextEditingController _repNumCtrl =
+      TextEditingController(text: '2');
+  // World p renders at viewer point p + _boardHalf; the opening
+  // translation (-H) puts world origin back where identity used to show it.
+  final TransformationController _pan = TransformationController(
+      Matrix4.translationValues(-_boardHalf, -_boardHalf, 0.0));
 
   /// Words pinned to an exact canvas spot (double-click placement,
   /// drag drops, tidy results). Null entry = auto-placed this layout.
@@ -191,6 +199,10 @@ class GraphViewState extends State<GraphView> {
   /// Link-drawing mode: drag from one bubble to another to attach them.
   bool _linkMode = false;
   String? _linkFrom;
+
+  /// Hand tool: drags the whole graph (even starting on a bubble).
+  /// Off = cursor tool: drags bubbles, the viewer only pans empty space.
+  bool _panTool = false;
   Offset? _linkFromPt; // canvas coords, temp line start
   Offset? _linkToPt; // canvas coords, temp line end
 
@@ -228,14 +240,26 @@ class GraphViewState extends State<GraphView> {
   static const double _picH = 118;
   static const double _slotGap = 196;
   static const double _levelGap = 148;
-  static const double _margin = 140;
 
-  /// The board is unbounded: words live anywhere finite, and the place
-  /// grows whichever way they are dragged. Only NaN/inf (corrupt saves)
-  /// get pulled back near the origin.
+  /// World coordinates are unbounded-ish (±100k each way: far more than
+  /// any map will ever need). The viewer child is one fixed giant box;
+  /// world point p renders at box point p + _boardHalf, so every corner
+  /// of the reachable place exists as a hittable widget from the start.
+  /// Nothing ever re-anchors: the shift is constant, so dragging can
+  /// never teleport the view.
+  static const double _boardHalf = 100000.0;
+  static const double _boardSize = 200000.0;
+  static Offset _toBox(Offset world) =>
+      Offset(world.dx + _boardHalf, world.dy + _boardHalf);
+
+  /// Only NaN/inf (corrupt saves) get pulled back near the origin.
   static Offset _sanitize(Offset p) => Offset(
-        p.dx.isFinite ? p.dx.clamp(-1e6, 1e6).toDouble() : 500.0,
-        p.dy.isFinite ? p.dy.clamp(-1e6, 1e6).toDouble() : 300.0,
+        p.dx.isFinite
+            ? p.dx.clamp(-_boardHalf, _boardHalf).toDouble()
+            : 500.0,
+        p.dy.isFinite
+            ? p.dy.clamp(-_boardHalf, _boardHalf).toDouble()
+            : 300.0,
       );
 
   @override
@@ -243,6 +267,7 @@ class GraphViewState extends State<GraphView> {
     _linkedCtrl.dispose();
     _jumpCtrl.dispose();
     _nameCtrl.dispose();
+    _repNumCtrl.dispose();
     _pan.dispose();
     super.dispose();
   }
@@ -272,8 +297,8 @@ class GraphViewState extends State<GraphView> {
     final c = _lastPlaced[word];
     if (c == null) return;
     _pan.value = Matrix4.translationValues(
-      viewport.width / 2 - c.dx,
-      viewport.height / 2 - c.dy,
+      viewport.width / 2 - (c.dx + _boardHalf),
+      viewport.height / 2 - (c.dy + _boardHalf),
       0.0,
     );
   }
@@ -460,6 +485,8 @@ class GraphViewState extends State<GraphView> {
   @visibleForTesting
   double debugScale() => _pan.value.getMaxScaleOnAxis();
   @visibleForTesting
+  bool debugPanTool() => _panTool;
+  @visibleForTesting
   Offset? debugEdgeMid(String a, String b) {
     final x = WordGraph.norm(a);
     final y = WordGraph.norm(b);
@@ -476,7 +503,7 @@ class GraphViewState extends State<GraphView> {
     final box =
         _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return canvasPt;
-    return box.localToGlobal(canvasPt);
+    return box.localToGlobal(_toBox(canvasPt));
   }
 
 
@@ -495,12 +522,13 @@ class GraphViewState extends State<GraphView> {
     );
   }
 
-  /// Screen point -> canvas point (pan/zoom aware).
+  /// Screen point -> world point (pan/zoom aware).
   Offset _toCanvas(Offset global) {
     final box =
         _canvasKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null || !box.hasSize) return global;
-    return box.globalToLocal(global);
+    final v = box.globalToLocal(global);
+    return Offset(v.dx - _boardHalf, v.dy - _boardHalf);
   }
 
   Size _nodeSize(String word) {
@@ -633,6 +661,20 @@ class GraphViewState extends State<GraphView> {
   void _toggleLinkMode() {
     setState(() {
       _linkMode = !_linkMode;
+      _panTool = false;
+      _linkFrom = null;
+      _linkFromPt = null;
+      _linkToPt = null;
+      _selEdge = null;
+    });
+  }
+
+  /// One tool at a time: hand pans the graph, cursor moves bubbles.
+  /// Link mode always steps aside.
+  void _pickTool(bool pan) {
+    setState(() {
+      _panTool = pan;
+      _linkMode = false;
       _linkFrom = null;
       _linkFromPt = null;
       _linkToPt = null;
@@ -662,6 +704,7 @@ class GraphViewState extends State<GraphView> {
   // where the pointer is — no drift math at all.
   void _pointerDown(PointerDownEvent e) {
     if (_dragPointer != null) _abandonDrag(); // heal any stuck drag
+    if (_panTool) return; // hand tool: viewer pans, bubbles stay put
     final at = _toCanvas(e.position);
     final word = _bubbleAt(at);
     if (word == null) return; // empty space: viewer pans normally
@@ -772,8 +815,8 @@ class GraphViewState extends State<GraphView> {
     final bw = math.max(200.0, maxX - minX + pad * 2);
     final bh = math.max(200.0, maxY - minY + pad * 2);
     final s = (math.min(vw / bw, vh / bh)).clamp(0.05, 1.0);
-    final cx = (minX + maxX) / 2;
-    final cy = (minY + maxY) / 2;
+    final cx = (minX + maxX) / 2 + _boardHalf;
+    final cy = (minY + maxY) / 2 + _boardHalf;
     final base = Matrix4.translationValues(
         vw / 2 - cx * s, vh / 2 - cy * s, 0.0);
     final m = base..scaleByDouble(s, s, s, 1.0);
@@ -976,14 +1019,15 @@ class GraphViewState extends State<GraphView> {
     return url.trim();
   }
 
-  /// Canvas point currently at the middle of the viewport.
+  /// World point currently at the middle of the viewport.
   Offset _viewCenterCanvas() {
     final s = _pan.value.getMaxScaleOnAxis().clamp(0.05, 2.5);
     final t = _pan.value.getTranslation();
     final vw = _viewportSize.width;
     final vh = _viewportSize.height;
     if (vw <= 0 || vh <= 0) return const Offset(600, 500);
-    return Offset((vw / 2 - t.x) / s, (vh / 2 - t.y) / s);
+    return Offset(
+        (vw / 2 - t.x) / s - _boardHalf, (vh / 2 - t.y) / s - _boardHalf);
   }
 
   List<String> _filteredKeys() {
@@ -1017,7 +1061,177 @@ class GraphViewState extends State<GraphView> {
     if (node == null) return;
     node.image = null;
     await _persist();
-    _notice('Picture removed — "$sel" stays as a word.');
+    _notice('Picture removed - "$sel" stays as a word.');
+  }
+
+  /// Put the selected word on the spaced-repetition stack: it will come
+  /// back bundled with every word directly linked to it.
+  Future<void> _addRepetition(String word) async {
+    final minutes = await _askInterval(word);
+    if (minutes == null || minutes <= 0 || !mounted) return;
+    final key = WordGraph.norm(word);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final items = await widget.storage.loadRepetition();
+    RepetitionItem? existing;
+    for (final i in items) {
+      if (i.word == key) existing = i;
+    }
+    if (existing != null) {
+      existing.intervalMinutes = minutes;
+      existing.dueAt = now + minutes * 60000;
+    } else {
+      items.add(RepetitionItem(
+          id: '$now',
+          word: key,
+          intervalMinutes: minutes,
+          createdAt: now,
+          dueAt: now + minutes * 60000));
+    }
+    await widget.storage.saveRepetition(items);
+    if (mounted) {
+      _notice('"$key" repeats ${intervalText(minutes)} — '
+          'first review ${dueText(now + minutes * 60000, now)}.');
+    }
+  }
+
+  /// Review rhythm picker: preset chips plus a custom number + unit.
+  Future<int?> _askInterval(String word) async {
+    const presets = <int>[1, 5, 15, 60, 1440, 2880, 4320, 10080];
+    const presetLabels = <String>[
+      '1 min', '5 min', '15 min', '1 hour',
+      '1 day', '2 days', '3 days', '7 days'
+    ];
+    const units = <String>['minutes', 'hours', 'days'];
+    _repNumCtrl.text = '2';
+    var unit = 'days';
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          backgroundColor: const Color(0xFFF4EEDF),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16)),
+          title: Text('Repeat "$word" every…',
+              style: const TextStyle(
+                  color: PaperTheme.ink, fontSize: 16)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (var i = 0; i < presets.length; i++)
+                      InkWell(
+                        onTap: () =>
+                            Navigator.of(ctx).pop(presets[i]),
+                        borderRadius: BorderRadius.circular(12),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: PaperTheme.surface,
+                            border: Border.all(
+                                color: PaperTheme.lineThin),
+                            borderRadius:
+                                BorderRadius.circular(12),
+                          ),
+                          child: Text(presetLabels[i],
+                              style: const TextStyle(
+                                  color: PaperTheme.ink,
+                                  fontSize: 12)),
+                        ),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    SizedBox(
+                      width: 64,
+                      child: TextField(
+                        controller: _repNumCtrl,
+                        keyboardType: TextInputType.number,
+                        style: const TextStyle(
+                            color: PaperTheme.ink,
+                            fontSize: 13),
+                        cursorColor: PaperTheme.ink,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          contentPadding:
+                              EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 8),
+                          enabledBorder: OutlineInputBorder(
+                            borderSide: BorderSide(
+                                color: PaperTheme.lineThin),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderSide: BorderSide(
+                                color: PaperTheme.ink),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: DropdownButton<String>(
+                        value: unit,
+                        isExpanded: true,
+                        style: const TextStyle(
+                            color: PaperTheme.ink,
+                            fontSize: 13),
+                        items: [
+                          for (final u in units)
+                            DropdownMenuItem(
+                                value: u, child: Text(u)),
+                        ],
+                        onChanged: (v) {
+                          if (v != null) {
+                            setDialog(() => unit = v);
+                          }
+                        },
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        final n = int.tryParse(
+                            _repNumCtrl.text.trim());
+                        if (n == null || n <= 0) {
+                          Navigator.of(ctx).pop(-1);
+                          return;
+                        }
+                        final mult = unit == 'minutes'
+                            ? 1
+                            : unit == 'hours'
+                                ? 60
+                                : 1440;
+                        Navigator.of(ctx).pop(n * mult);
+                      },
+                      child: const Text('OK',
+                          style: TextStyle(
+                              color: PaperTheme.ink,
+                              fontWeight: FontWeight.w700)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Cancel',
+                  style: TextStyle(color: PaperTheme.inkSoft)),
+            ),
+          ],
+        ),
+      ),
+    );
+    // NOTE: _repNumCtrl is intentionally NOT disposed here (see field docs).
+    if (picked == null || picked <= 0) return null;
+    return picked;
   }
 
   static const List<int> _palette = [
@@ -1264,20 +1478,9 @@ class GraphViewState extends State<GraphView> {
       }
     }
 
-    var minX = 1e9, minY = 1e9, maxRight = -1e9, maxBottom = -1e9;
-    for (final p in placed) {
-      if (p.center.dx < minX) minX = p.center.dx;
-      if (p.center.dy < minY) minY = p.center.dy;
-      if (p.center.dx > maxRight) maxRight = p.center.dx;
-      if (p.center.dy > maxBottom) maxBottom = p.center.dy;
-    }
-    // The place stretches whichever way the words go (negatives included);
-    // the box just hints painters, children may overflow it freely.
-    final left = math.min(0.0, minX - _margin);
-    final top = math.min(0.0, minY - _margin);
-    final w = math.max(2200.0, maxRight + _margin - left);
-    final h = math.max(1500.0, maxBottom + _margin - top);
-    return (placed: placed, edges: edges, canvas: Size(w, h));
+    // Fixed giant box covering the whole reachable place; positioned
+    // children render at world + _boardHalf (see _toBox).
+    return (placed: placed, edges: edges, canvas: const Size(_boardSize, _boardSize));
   }
 
   @override
@@ -1553,6 +1756,14 @@ class GraphViewState extends State<GraphView> {
                               size: 17,
                               color: PaperTheme.inkSoft),
                         ),
+                        IconButton(
+                          tooltip: 'Add to spaced repetition',
+                          onPressed: () =>
+                              _addRepetition(sel.name),
+                          icon: const Icon(Icons.repeat_outlined,
+                              size: 17,
+                              color: PaperTheme.inkSoft),
+                        ),
                         if (sel.hasImage)
                           TextButton.icon(
                             onPressed: _removePicture,
@@ -1622,7 +1833,11 @@ class GraphViewState extends State<GraphView> {
                                 ),
                               ),
                             ),
-                            InteractiveViewer(
+                            MouseRegion(
+                              cursor: _panTool
+                                  ? SystemMouseCursors.grab
+                                  : SystemMouseCursors.basic,
+                              child: InteractiveViewer(
                               transformationController: _pan,
                               panEnabled: _draggingNode == null,
                               scaleEnabled: _draggingNode == null,
@@ -1667,14 +1882,18 @@ class GraphViewState extends State<GraphView> {
                                       ),
                                     ),
                                     IgnorePointer(
-                                      child: CustomPaint(
-                                        size: laid.canvas,
-                                        painter: _BranchPainter(
-                                            laid.edges,
-                                            tempFrom: _linkFromPt,
-                                            tempTo: _linkToPt,
-                                            selA: _selEdge?.a,
-                                            selB: _selEdge?.b),
+                                      child: Transform.translate(
+                                        offset: const Offset(
+                                            _boardHalf, _boardHalf),
+                                        child: CustomPaint(
+                                          size: laid.canvas,
+                                          painter: _BranchPainter(
+                                              laid.edges,
+                                              tempFrom: _linkFromPt,
+                                              tempTo: _linkToPt,
+                                              selA: _selEdge?.a,
+                                              selB: _selEdge?.b),
+                                        ),
                                       ),
                                     ),
                                     // Chip on the selected link: delete it,
@@ -1686,14 +1905,13 @@ class GraphViewState extends State<GraphView> {
                                             (e.a == _selEdge!.b &&
                                                 e.b == _selEdge!.a))
                                           Positioned(
-                                            left: (e.mid.dx - 95)
-                                                .clamp(
-                                                    8.0,
-                                                    (laid.canvas.width -
-                                                            198)
-                                                        .clamp(
-                                                            8.0, 1e6)),
-                                            top: (e.mid.dy - 52)
+                                            left: (e.mid.dx +
+                                                        _boardHalf -
+                                                        95)
+                                                .clamp(8.0, 1e6),
+                                            top: (e.mid.dy +
+                                                        _boardHalf -
+                                                        52)
                                                 .clamp(8.0, 1e6),
                                             child: GestureDetector(
                                               onTap:
@@ -1808,8 +2026,12 @@ class GraphViewState extends State<GraphView> {
                                           ),
                                     for (final p in laid.placed)
                                       Positioned(
-                                        left: p.center.dx - p.w / 2,
-                                        top: p.center.dy - p.h / 2,
+                                        left: p.center.dx +
+                                            _boardHalf -
+                                            p.w / 2,
+                                        top: p.center.dy +
+                                            _boardHalf -
+                                            p.h / 2,
                                         child: GestureDetector(
                                           // Taps select / drill; all dragging
                                           // is driven by the canvas pointer
@@ -1850,6 +2072,7 @@ class GraphViewState extends State<GraphView> {
                                   ],
                                 ),
                               ),
+                            ),
                             ),
                             // Link-mode banner.
                             if (_linkMode)
@@ -1908,6 +2131,32 @@ class GraphViewState extends State<GraphView> {
                                                   .inkSoft),
                                     ),
                                     IconButton(
+                                      tooltip: 'Drag the graph itself',
+                                      onPressed: () =>
+                                          _pickTool(true),
+                                      icon: Icon(
+                                          Icons.pan_tool_outlined,
+                                          size: 16,
+                                          color: _panTool
+                                              ? PaperTheme.ink
+                                              : PaperTheme
+                                                  .inkSoft),
+                                    ),
+                                    IconButton(
+                                      tooltip:
+                                          'Select and drag words',
+                                      onPressed: () =>
+                                          _pickTool(false),
+                                      icon: Icon(
+                                          Icons.near_me_outlined,
+                                          size: 16,
+                                          color: !_panTool &&
+                                                  !_linkMode
+                                              ? PaperTheme.ink
+                                              : PaperTheme
+                                                  .inkSoft),
+                                    ),
+                                    IconButton(
                                       tooltip: 'Fit everything in view',
                                       onPressed: _fitView,
                                       icon: const Icon(
@@ -1943,7 +2192,7 @@ class GraphViewState extends State<GraphView> {
                               left: 12,
                               bottom: 14,
                               child: Text(
-                                'drag bubbles to arrange (they stay) · click a line to cut it · double-click space: new word · link tool: drag bubble to bubble',
+                                'hand drags the graph · cursor drags bubbles (they stay) · double-click space: new word · click a line to cut it',
                                 style: TextStyle(
                                     color: PaperTheme.inkSoft,
                                     fontSize: 10),

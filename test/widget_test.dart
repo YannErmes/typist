@@ -16,12 +16,24 @@ import 'package:word_graph_tool/sheet_view.dart'
         SheetView,
         SheetViewState,
         countWords,
-        findGraphMatches,
         findUnknownRanges;
 import 'package:word_graph_tool/computer_video.dart';
+import 'package:word_graph_tool/repetition_logic.dart';
 import 'package:word_graph_tool/storage.dart';
 import 'package:word_graph_tool/frame_link.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
+
+/// Desktop-wide window so the floating nav pill never covers the
+/// bottom-anchored controls these tests tap (graph toolbar, fix-it chip).
+Future<void> wideWindow(WidgetTester tester) async {
+  tester.view.physicalSize = const Size(1280, 800);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(() {
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+  });
+  await tester.pump(const Duration(milliseconds: 100));
+}
 
 void main() {
   test('grammar prompt carries checked structures and strict rules', () {
@@ -579,6 +591,7 @@ void main() {
 
   testWidgets('fix-it sheet lists typos and Learn clears them',
       (WidgetTester tester) async {
+    await wideWindow(tester);
     await tester.pumpWidget(const WordGraphToolApp());
     for (var i = 0;
         i < 60 && find.byType(EditableText).evaluate().isEmpty;
@@ -686,6 +699,7 @@ void main() {
 
   testWidgets('fit button centers a huge spread instead of stranding it',
       (WidgetTester tester) async {
+    await wideWindow(tester);
     await tester.pumpWidget(const WordGraphToolApp());
     await tester.pump(const Duration(seconds: 5));
     await tester.pump(const Duration(seconds: 5));
@@ -710,13 +724,46 @@ void main() {
     expect(s, lessThan(0.19));
     expect(s, greaterThanOrEqualTo(0.05));
     // The middle of the map lands near the middle of the canvas area
-    // (right of the 208px word rail in the 800px test window).
+    // (right of the 208px word rail in the 1280px test window).
     final a = state.debugCenter('meal')!;
     final b = state.debugCenter('eat')!;
     final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
     final onScreen = state.debugToGlobal(mid);
-    expect((onScreen.dx - 504).abs(), lessThan(200));
+    expect((onScreen.dx - 744).abs(), lessThan(200));
     expect((onScreen.dy - 300).abs(), lessThan(200));
+  });
+
+  testWidgets('hand tool pans the graph, cursor tool drags words',
+      (WidgetTester tester) async {
+    await wideWindow(tester);
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('Graph'));
+    await tester.pump(const Duration(milliseconds: 500));
+    final state =
+        tester.state<GraphViewState>(find.byType(GraphView).first);
+    final m0 = state.debugCenter('meal')!;
+    final g0 = state.debugToGlobal(m0);
+    // Hand tool: a drag starting ON the bubble pans instead of moving
+    // it (drag left so the bubble stays on the 800px test window).
+    await tester.tap(find.byTooltip('Drag the graph itself'));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.dragFrom(
+        state.debugToGlobal(m0), const Offset(-150, 0));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(state.debugCenter('meal'), m0);
+    final g1 = state.debugToGlobal(m0);
+    expect(g0.dx - g1.dx, greaterThan(100));
+    // Cursor tool: the same drag moves the bubble again.
+    await tester.tap(find.byTooltip('Select and drag words'));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.dragFrom(
+        state.debugToGlobal(m0), const Offset(50, 0));
+    await tester.pump(const Duration(milliseconds: 500));
+    final m1 = state.debugCenter('meal')!;
+    expect(m1.dx, closeTo(m0.dx + 50, 2.0));
   });
 
   testWidgets('dragged word stays exactly where dropped',
@@ -872,6 +919,79 @@ void main() {
     expect(find.text('If I had known, I would have come.'),
         findsOneWidget);
     expect(find.text('Conditionals (1)'), findsOneWidget);
+  });
+
+  test('repetition rhythms read naturally', () {
+    expect(intervalText(1), 'every minute');
+    expect(intervalText(5), 'every 5 minutes');
+    expect(intervalText(60), 'every hour');
+    expect(intervalText(120), 'every 2 hours');
+    expect(intervalText(1440), 'every day');
+    expect(intervalText(4320), 'every 3 days');
+    const now = 1000000000000;
+    expect(dueText(now, now), 'due now');
+    expect(dueText(now + 30000, now), 'due any second');
+    expect(dueText(now + 5 * 60000, now), 'due in 5 min');
+    expect(dueText(now + 2 * 3600000, now), 'due in 2 h');
+    expect(dueText(now + 3 * 86400000, now), 'due in 3 d');
+    expect(dueText(now - 2 * 86400000, now), 'overdue by 2 d');
+  });
+
+  test('repetition bundle is the word plus its links', () {
+    final g = WordGraph();
+    g.connect('house', 'bedroom');
+    g.connect('house', 'living room');
+    g.connect('bedroom', 'pillow');
+    final bundle = bundleFor(g, 'house');
+    expect(bundle.first, 'house');
+    expect(bundle.toSet(), {'house', 'bedroom', 'living room'});
+    expect(bundleFor(g, 'missing'), isEmpty);
+  });
+
+  test('practice counts used words whole-word only', () {
+    const words = ['house', 'bedroom'];
+    expect(usedWords('The HOUSE has a bedroom.', words),
+        {'house', 'bedroom'});
+    expect(usedWords('The greenhouse is big.', words), isEmpty);
+    expect(usedWords('', words), isEmpty);
+  });
+
+  test('repetition items save, reload and reschedule', () async {
+    final s = StorageService();
+    await s.init();
+    const now = 1000000000000;
+    await s.saveRepetition([
+      RepetitionItem(
+          id: 'a', word: 'house', intervalMinutes: 1440,
+          createdAt: now, dueAt: now + 86400000),
+      RepetitionItem(
+          id: 'b', word: 'eat', intervalMinutes: 1,
+          createdAt: now, dueAt: now + 60000),
+    ]);
+    var back = await s.loadRepetition();
+    expect(back.length, 2);
+    expect(back.first.word, 'house');
+    expect(back.first.intervalMinutes, 1440);
+    // Finishing pushes the due date out by the same rhythm.
+    back.first.dueAt = now + 1440 * 60000;
+    await s.saveRepetition(back);
+    back = await s.loadRepetition();
+    expect(
+        back.firstWhere((e) => e.id == 'a').dueAt,
+        now + 1440 * 60000);
+  });
+
+  testWidgets('practice tab opens an empty stack',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('Practice'));
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(find.text('Spaced repetition'), findsOneWidget);
+    expect(find.textContaining('No practices yet'), findsOneWidget);
   });
 
   testWidgets('stream panel offers a file and reports it missing',

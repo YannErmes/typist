@@ -151,3 +151,25 @@ class WordGraph {
 
   bool get isEmpty => nodes.isEmpty;
 }
+
+/// Whole-word, case-insensitive matches with the graph word each hit.
+/// Shared by the writing highlight pass and the repetition practice check.
+List<({int start, int end, String word})> findGraphMatches(
+    String text, List<String> words) {
+  final result = <({int start, int end, String word})>[];
+  final keys = words.where((w) => w.trim().isNotEmpty).toList();
+  if (keys.isEmpty || text.isEmpty) return result;
+  final lower = <String, String>{};
+  for (final k in keys) {
+    lower.putIfAbsent(k.toLowerCase(), () => k);
+  }
+  final escaped = lower.keys.map(RegExp.escape).toList()
+    ..sort((a, b) => b.length.compareTo(a.length));
+  final re =
+      RegExp('\\b(?:${escaped.join('|')})\\b', caseSensitive: false);
+  for (final m in re.allMatches(text)) {
+    result.add(
+        (start: m.start, end: m.end, word: lower[m.group(0)!.toLowerCase()]!));
+  }
+  return result;
+}

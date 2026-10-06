@@ -20,6 +20,55 @@ class WritingSession {
       {this.folder = 'Notes', this.videoUrl = ''});
 }
 
+/// One spaced-repetition practice: a graph word plus its review rhythm.
+/// The bundle itself (word + linked words) is read live from the graph,
+/// so it always reflects the current map; only the rhythm is stored.
+class RepetitionItem {
+  final String id;
+  String word;
+  int intervalMinutes;
+  int createdAt;
+  int dueAt;
+  RepetitionItem({
+    required this.id,
+    required this.word,
+    required this.intervalMinutes,
+    required this.createdAt,
+    required this.dueAt,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'word': word,
+        'intervalMinutes': intervalMinutes,
+        'createdAt': createdAt,
+        'dueAt': dueAt,
+      };
+
+  static RepetitionItem? fromJson(dynamic raw) {
+    if (raw is! Map) return null;
+    final word = (raw['word'] ?? '').toString().trim().toLowerCase();
+    if (word.isEmpty) return null;
+    int asInt(dynamic v, int fallback) {
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      return int.tryParse(v.toString()) ?? fallback;
+    }
+
+    return RepetitionItem(
+      id: (raw['id'] ?? '').toString().isEmpty
+          ? '${DateTime.now().millisecondsSinceEpoch}'
+          : (raw['id']).toString(),
+      word: word,
+      intervalMinutes: asInt(raw['intervalMinutes'], 1440),
+      createdAt: asInt(
+          raw['createdAt'], DateTime.now().millisecondsSinceEpoch),
+      dueAt: asInt(raw['dueAt'],
+          DateTime.now().millisecondsSinceEpoch + 86400000),
+    );
+  }
+}
+
 /// One reference sentence on the grammar page.
 class GrammarItem {
   final String id;
@@ -222,6 +271,48 @@ class StorageService {
   List<String> _memoryFolders = [];
   List<String> _memoryLearned = [];
   List<Map<String, dynamic>> _memoryGrammar = [];
+  List<Map<String, dynamic>> _memoryRepetition = [];
+
+  File? get _repetitionFile => _base == null
+      ? null
+      : File(
+          '${_base!.path}${Platform.pathSeparator}repetition.json');
+
+  /// Spaced-repetition practices, in no particular order (the page sorts).
+  Future<List<RepetitionItem>> loadRepetition() async {
+    List<dynamic> raw;
+    if (_repetitionFile == null) {
+      raw = _memoryRepetition;
+    } else {
+      try {
+        final file = _repetitionFile!;
+        if (!await file.exists()) return [];
+        raw = jsonDecode(await file.readAsString()) as List;
+      } catch (_) {
+        return [];
+      }
+    }
+    final out = <RepetitionItem>[];
+    for (final e in raw) {
+      final item = RepetitionItem.fromJson(e);
+      if (item != null) out.add(item);
+    }
+    return out;
+  }
+
+  Future<void> saveRepetition(List<RepetitionItem> items) async {
+    final raw = [for (final i in items) i.toJson()];
+    if (_repetitionFile == null) {
+      _memoryRepetition =
+          raw.map((e) => Map<String, dynamic>.of(e)).toList();
+      return;
+    }
+    try {
+      await _repetitionFile!.writeAsString(jsonEncode(raw));
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
+  }
 
   File? get _grammarFile => _base == null
       ? null

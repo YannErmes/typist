@@ -9,6 +9,7 @@ import 'forbidden_view.dart';
 import 'grammar_view.dart';
 import 'graph_model.dart';
 import 'graph_view.dart';
+import 'repetition_view.dart';
 import 'sheet_view.dart';
 import 'storage.dart';
 import 'theme.dart';
@@ -26,17 +27,19 @@ class CrashCenter {
 }
 
 void main() {
-  runZonedGuarded(() {
-    FlutterError.onError = (details) {
-      final text =
-          '${details.exceptionAsString()}\n${details.stack ?? ''}';
-      CrashCenter.record(text);
-      FlutterError.presentError(details);
-    };
-    runApp(const WordGraphToolApp());
-  }, (error, stack) {
-    CrashCenter.record('$error\n$stack');
-  });
+  runZonedGuarded(
+    () {
+      FlutterError.onError = (details) {
+        final text = '${details.exceptionAsString()}\n${details.stack ?? ''}';
+        CrashCenter.record(text);
+        FlutterError.presentError(details);
+      };
+      runApp(const WordGraphToolApp());
+    },
+    (error, stack) {
+      CrashCenter.record('$error\n$stack');
+    },
+  );
 }
 
 /// Storage handle used only for crash logging (set once the shell boots).
@@ -64,7 +67,8 @@ class WordGraphToolApp extends StatelessWidget {
   }
 }
 
-/// Three views: Sheet (writing), Graph (word network), Banned (forbidden).
+/// Four views: Sheet (writing), Graph (word network), Banned (forbidden),
+/// Grammar (structures), Practice (spaced repetition).
 class HomeShell extends StatefulWidget {
   final StorageService? storage;
   const HomeShell({super.key, this.storage});
@@ -121,24 +125,64 @@ class _HomeShellState extends State<HomeShell> {
     _sheetKey.currentState?.refreshGraph();
   }
 
-  Widget _tabButton(int index, IconData icon, String label) {
-    final active = _tab == index;
-    return TextButton.icon(
-      onPressed: () => setState(() => _tab = index),
-      style: TextButton.styleFrom(
-        padding: const EdgeInsets.symmetric(horizontal: 6),
-        minimumSize: const Size(0, 36),
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+  /// Small floating nav pill (always on top of the current tab).
+  Widget _navPill() {
+    return Material(
+      elevation: 6,
+      shadowColor: const Color(0xFF3E3A31).withValues(alpha: 0.25),
+      borderRadius: BorderRadius.circular(24),
+      color: PaperTheme.surface,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(24),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _pillItem(0, Icons.edit_note, 'Sheet'),
+            _pillItem(1, Icons.account_tree, 'Graph'),
+            _pillItem(2, Icons.block, 'Banned'),
+            _pillItem(3, Icons.spellcheck, 'Grammar'),
+            _pillItem(4, Icons.repeat_outlined, 'Practice'),
+          ],
+        ),
       ),
-      icon: Icon(icon,
-          size: 18,
-          color: active ? PaperTheme.ink : PaperTheme.inkSoft),
-      label: Text(label,
-          style: TextStyle(
-              fontSize: 13,
+    );
+  }
+
+  Widget _pillItem(int index, IconData icon, String label) {
+    final active = _tab == index;
+    return InkWell(
+      onTap: () => setState(() => _tab = index),
+      borderRadius: BorderRadius.circular(18),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        decoration: BoxDecoration(
+          color: active ? PaperTheme.card : Colors.transparent,
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              icon,
+              size: 17,
               color: active ? PaperTheme.ink : PaperTheme.inkSoft,
-              fontWeight:
-                  active ? FontWeight.w700 : FontWeight.normal)),
+            ),
+            const SizedBox(width: 5),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                color: active ? PaperTheme.ink : PaperTheme.inkSoft,
+                fontWeight: active ? FontWeight.w700 : FontWeight.normal,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -151,36 +195,24 @@ class _HomeShellState extends State<HomeShell> {
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(7),
-              child: Image.asset('assets/logo.png',
-                  width: 28, height: 28),
+              child: Image.asset('assets/logo.png', width: 28, height: 28),
             ),
             const SizedBox(width: 10),
             const Flexible(
-              child: Text('Word Graph Tool',
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                      fontSize: 16, fontWeight: FontWeight.w600)),
+              child: Text(
+                'Word Graph Tool',
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              ),
             ),
           ],
         ),
-        actions: [
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _tabButton(0, Icons.edit_note, 'Sheet'),
-                _tabButton(1, Icons.account_tree, 'Graph'),
-                _tabButton(2, Icons.block, 'Banned'),
-                _tabButton(3, Icons.spellcheck, 'Grammar'),
-                const SizedBox(width: 12),
-              ],
-            ),
-          ),
-        ],
       ),
-      body: !_ready
-          ? Center(
+      body: Stack(
+        children: [
+          // Full-bleed tabs: content flows behind the floating pill.
+          if (!_ready)
+            Center(
               child: _error != null
                   ? Text('Storage error: $_error')
                   : const SizedBox(
@@ -189,7 +221,8 @@ class _HomeShellState extends State<HomeShell> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     ),
             )
-          : IndexedStack(
+          else
+            IndexedStack(
               index: _tab,
               children: [
                 SheetView(
@@ -204,15 +237,32 @@ class _HomeShellState extends State<HomeShell> {
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
                 ),
-                ForbiddenPage(
+                ForbiddenPage(storage: _storage, words: _forbidden),
+                GrammarPage(storage: _storage),
+                RepetitionView(
                   storage: _storage,
-                  words: _forbidden,
-                ),
-                GrammarPage(
-                  storage: _storage,
+                  graph: _graph,
+                  onGraphChanged: _onGraphChanged,
                 ),
               ],
             ),
+          if (_ready)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: SafeArea(
+                top: false,
+                child: Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: _navPill(),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
       floatingActionButton: ValueListenableBuilder<String?>(
         valueListenable: CrashCenter.lastCrash,
         builder: (context, crash, _) {
@@ -234,19 +284,21 @@ class _HomeShellState extends State<HomeShell> {
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFFF4EEDF),
-        title: const Text('What broke',
-            style: TextStyle(
-                color: PaperTheme.ink,
-                fontSize: 15,
-                fontWeight: FontWeight.w700)),
+        title: const Text(
+          'What broke',
+          style: TextStyle(
+            color: PaperTheme.ink,
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
         content: SizedBox(
           width: 520,
           height: 380,
           child: SingleChildScrollView(
             child: SelectableText(
               crash.length > 6000 ? crash.substring(0, 6000) : crash,
-              style: const TextStyle(
-                  color: PaperTheme.ink, fontSize: 11),
+              style: const TextStyle(color: PaperTheme.ink, fontSize: 11),
             ),
           ),
         ),
@@ -256,18 +308,23 @@ class _HomeShellState extends State<HomeShell> {
               Clipboard.setData(ClipboardData(text: crash));
               Navigator.of(ctx).pop();
             },
-            child: const Text('Copy',
-                style: TextStyle(
-                    color: PaperTheme.ink,
-                    fontWeight: FontWeight.w700)),
+            child: const Text(
+              'Copy',
+              style: TextStyle(
+                color: PaperTheme.ink,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
           ),
           TextButton(
             onPressed: () {
               CrashCenter.lastCrash.value = null;
               Navigator.of(ctx).pop();
             },
-            child: const Text('Dismiss',
-                style: TextStyle(color: PaperTheme.inkSoft)),
+            child: const Text(
+              'Dismiss',
+              style: TextStyle(color: PaperTheme.inkSoft),
+            ),
           ),
         ],
       ),
