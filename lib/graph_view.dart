@@ -220,7 +220,6 @@ class GraphViewState extends State<GraphView> {
   Map<String, Offset> _lastPlaced = {};
   Map<String, Size> _lastSizes = {};
   List<_Edge> _lastEdges = [];
-  Size _lastCanvas = Size.zero;
   final GlobalKey _canvasKey = GlobalKey();
 
   static const double _nodeW = 148;
@@ -231,15 +230,12 @@ class GraphViewState extends State<GraphView> {
   static const double _levelGap = 148;
   static const double _margin = 140;
 
-  /// Board limits: words always stay on reachable canvas.
-  static const double _boardMin = 40;
-  static const double _boardMax = 5600;
-  static const double _canvasMax = 6200;
-
-  /// Clamp a canvas point onto the reachable board.
-  static Offset _clampBoard(Offset p) => Offset(
-        p.dx.clamp(_boardMin, _boardMax).toDouble(),
-        p.dy.clamp(_boardMin, _boardMax).toDouble(),
+  /// The board is unbounded: words live anywhere finite, and the place
+  /// grows whichever way they are dragged. Only NaN/inf (corrupt saves)
+  /// get pulled back near the origin.
+  static Offset _sanitize(Offset p) => Offset(
+        p.dx.isFinite ? p.dx.clamp(-1e6, 1e6).toDouble() : 500.0,
+        p.dy.isFinite ? p.dy.clamp(-1e6, 1e6).toDouble() : 300.0,
       );
 
   @override
@@ -255,11 +251,11 @@ class GraphViewState extends State<GraphView> {
   void initState() {
     super.initState();
     // Adopt saved arrangement: the map opens exactly as it was left.
-    // Bad or unreachable spots are pulled back onto the board.
+    // Corrupt spots are pulled back near the origin.
     for (final n in widget.graph.nodes.values) {
       if (n.hasPos && n.x!.isFinite && n.y!.isFinite) {
         _customPos[WordGraph.norm(n.name)] =
-            _clampBoard(Offset(n.x!, n.y!));
+            _sanitize(Offset(n.x!, n.y!));
       }
     }
     final init = widget.initialWord;
@@ -367,7 +363,7 @@ class GraphViewState extends State<GraphView> {
   _Edge? _nearestEdge(Offset pt) {
     // Generous, zoom-aware grab radius so lines stay tappable when zoomed out.
     final scale =
-        _pan.value.getMaxScaleOnAxis().clamp(0.3, 2.5);
+        _pan.value.getMaxScaleOnAxis().clamp(0.05, 2.5);
     _Edge? best;
     var bestD = 30.0 / scale;
     for (final e in _lastEdges) {
@@ -461,6 +457,8 @@ class GraphViewState extends State<GraphView> {
   /// Test hooks: canvas coords of a link's midpoint, and canvas->screen.
   @visibleForTesting
   Offset? debugCenter(String word) => _lastPlaced[word];
+  @visibleForTesting
+  double debugScale() => _pan.value.getMaxScaleOnAxis();
   @visibleForTesting
   Offset? debugEdgeMid(String a, String b) {
     final x = WordGraph.norm(a);
@@ -594,12 +592,7 @@ class GraphViewState extends State<GraphView> {
     if (name == null || !mounted) return;
     widget.graph.ensure(name);
     setState(() {
-      _customPos[name] = Offset(
-        scene.dx.clamp(
-            90, (_lastCanvas.width - 90).clamp(90, 1e6)),
-        scene.dy.clamp(
-            60, (_lastCanvas.height - 60).clamp(60, 1e6)),
-      );
+      _customPos[name] = _sanitize(scene);
     });
     _select(name);
     await _persist();
@@ -703,7 +696,7 @@ class GraphViewState extends State<GraphView> {
     if (!_linkMode) {
       // Pin the exact pointer spot so the drop is kept precisely.
       if (word != null) {
-        final c = _clampBoard(_toCanvas(e.position) + _grabOffset);
+        final c = _sanitize(_toCanvas(e.position) + _grabOffset);
         setState(() {
           _draggingNode = null;
           _customPos[word] = c;
@@ -754,13 +747,15 @@ class GraphViewState extends State<GraphView> {
 
   void _zoom(double factor) {
     final cur = _pan.value.getMaxScaleOnAxis();
-    final target = (cur * factor).clamp(0.3, 2.5);
+    final target = (cur * factor).clamp(0.05, 2.5);
     final m2 = _pan.value.clone();
     m2.scaleByDouble(target / cur, target / cur, target / cur, 1.0);
     _pan.value = m2;
   }
 
-  /// Fit every word into view (rescues bubbles parked off-screen).
+  /// Fit button: center the whole map and show as much of it as possible.
+  /// Huge spreads zoom out deep (never below readability's basement);
+  /// whatever still overflows is cropped around the centered middle.
   void _fitView() {
     if (_lastPlaced.isEmpty) return;
     final vw = _viewportSize.width;
@@ -776,7 +771,7 @@ class GraphViewState extends State<GraphView> {
     const pad = 140.0;
     final bw = math.max(200.0, maxX - minX + pad * 2);
     final bh = math.max(200.0, maxY - minY + pad * 2);
-    final s = (math.min(vw / bw, vh / bh)).clamp(0.2, 1.0);
+    final s = (math.min(vw / bw, vh / bh)).clamp(0.05, 1.0);
     final cx = (minX + maxX) / 2;
     final cy = (minY + maxY) / 2;
     final base = Matrix4.translationValues(
@@ -983,7 +978,7 @@ class GraphViewState extends State<GraphView> {
 
   /// Canvas point currently at the middle of the viewport.
   Offset _viewCenterCanvas() {
-    final s = _pan.value.getMaxScaleOnAxis().clamp(0.3, 2.5);
+    final s = _pan.value.getMaxScaleOnAxis().clamp(0.05, 2.5);
     final t = _pan.value.getTranslation();
     final vw = _viewportSize.width;
     final vh = _viewportSize.height;
@@ -1269,14 +1264,19 @@ class GraphViewState extends State<GraphView> {
       }
     }
 
-    var maxRight = 0.0;
-    var maxBottom = 0.0;
+    var minX = 1e9, minY = 1e9, maxRight = -1e9, maxBottom = -1e9;
     for (final p in placed) {
+      if (p.center.dx < minX) minX = p.center.dx;
+      if (p.center.dy < minY) minY = p.center.dy;
       if (p.center.dx > maxRight) maxRight = p.center.dx;
       if (p.center.dy > maxBottom) maxBottom = p.center.dy;
     }
-    final w = math.max(2200.0, maxRight + _margin).clamp(0.0, _canvasMax);
-    final h = math.max(1500.0, maxBottom + _margin).clamp(0.0, _canvasMax);
+    // The place stretches whichever way the words go (negatives included);
+    // the box just hints painters, children may overflow it freely.
+    final left = math.min(0.0, minX - _margin);
+    final top = math.min(0.0, minY - _margin);
+    final w = math.max(2200.0, maxRight + _margin - left);
+    final h = math.max(1500.0, maxBottom + _margin - top);
     return (placed: placed, edges: edges, canvas: Size(w, h));
   }
 
@@ -1289,8 +1289,7 @@ class GraphViewState extends State<GraphView> {
     _lastSizes = {
       for (final p in laid.placed) p.word: Size(p.w, p.h)
     };
-    _lastEdges = laid.edges;
-    _lastCanvas = laid.canvas;
+  _lastEdges = laid.edges;
     final shown = _filteredKeys();
     final typed = _jumpCtrl.text.trim().toLowerCase();
     final showCreateRow =
@@ -1611,6 +1610,18 @@ class GraphViewState extends State<GraphView> {
                             }
                             return Stack(
                               children: [
+                            // Endless dot grid: fixed to the world, so the
+                            // place feels infinite whichever way you pan.
+                            Positioned.fill(
+                              child: ValueListenableBuilder<Matrix4>(
+                                valueListenable: _pan,
+                                builder: (_, _, _) => CustomPaint(
+                                  size: cons.biggest,
+                                  painter:
+                                      _InfiniteDotPainter(_pan.value),
+                                ),
+                              ),
+                            ),
                             InteractiveViewer(
                               transformationController: _pan,
                               panEnabled: _draggingNode == null,
@@ -1618,14 +1629,15 @@ class GraphViewState extends State<GraphView> {
                               constrained: false,
                               boundaryMargin:
                                   const EdgeInsets.all(double.infinity),
-                              minScale: 0.3,
+                              minScale: 0.05,
                               maxScale: 2.5,
                               child: SizedBox(
                                 key: _canvasKey,
                                 width: laid.canvas.width,
                                 height: laid.canvas.height,
                                 child: Stack(
-                                  children: [
+                                clipBehavior: Clip.none,
+                                children: [
                                     // Empty-space taps pick arrows; double-click plants a word.
                                     Positioned.fill(
                                       child: GestureDetector(
@@ -1654,9 +1666,6 @@ class GraphViewState extends State<GraphView> {
                                                 Colors.transparent),
                                       ),
                                     ),
-                                    const Positioned.fill(
-                                        child: IgnorePointer(
-                                            child: _DotGrid())),
                                     IgnorePointer(
                                       child: CustomPaint(
                                         size: laid.canvas,
@@ -2252,29 +2261,39 @@ class _BranchPainter extends CustomPainter {
       old.selB != selB;
 }
 
-/// Faint dot grid so the canvas feels like a mind-map board.
-class _DotGrid extends StatelessWidget {
-  const _DotGrid();
-  @override
-  Widget build(BuildContext context) {
-    return CustomPaint(painter: _DotGridPainter());
-  }
-}
+/// Endless faint dot grid, pinned to world coordinates: wherever the
+/// view pans or zooms, dots stay glued to the same world spots.
+class _InfiniteDotPainter extends CustomPainter {
+  final Matrix4 matrix;
+  const _InfiniteDotPainter(this.matrix);
 
-class _DotGridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
+    final s = matrix.getMaxScaleOnAxis();
+    if (s <= 0 || !s.isFinite) return;
+    // Far zoomed out, dots would be a 100k-circle mush: clean paper.
+    if (s < 0.2) return;
+    final tx = matrix.entry(0, 3);
+    final ty = matrix.entry(1, 3);
+    const step = 44.0;
     final paint = Paint()
       ..color = PaperTheme.lineThin.withValues(alpha: 0.55)
       ..style = PaintingStyle.fill;
-    const step = 44.0;
-    for (var x = step; x < size.width; x += step) {
-      for (var y = step; y < size.height; y += step) {
-        canvas.drawCircle(Offset(x, y), 1.1, paint);
+    // World-space span currently on screen; dots snap to the grid.
+    // (Clamped so a corrupt transform can never loop forever.)
+    var wx = ((-tx / s).clamp(-1e6, 1e6) / step).floor() * step;
+    final x1 = (size.width - tx) / s;
+    final y1 = (size.height - ty) / s;
+    for (; wx <= x1 && wx < 1e6; wx += step) {
+      var wy = ((-ty / s).clamp(-1e6, 1e6) / step).floor() * step;
+      for (; wy <= y1 && wy < 1e6; wy += step) {
+        canvas.drawCircle(
+            Offset(wx * s + tx, wy * s + ty), 1.1, paint);
       }
     }
   }
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  bool shouldRepaint(_InfiniteDotPainter old) =>
+      old.matrix != matrix;
 }

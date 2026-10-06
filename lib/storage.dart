@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:path_provider/path_provider.dart';
 
+import 'frame_link.dart';
 import 'graph_model.dart';
 
 /// One titled writing session (a document).
@@ -57,6 +58,14 @@ class GrammarItem {
 }
 
 /// All persistence is local files, written silently with dart:io.
+/// Layout: [Documents]/WordGraphTool/`sheets/<id>.json` (titled sessions
+/// with Quill delta content) + words per-word .md files.
+/// A stored video reference, minus leftovers from the retired YouTube
+/// flow (those links are unplayable by the local file player).
+String _cleanVideo(String? raw) {
+  final v = (raw ?? '').trim();
+  return FrameLink.isLegacyLink(v) ? '' : v;
+}
 /// Layout: [Documents]/WordGraphTool/`sheets/<id>.json` (titled sessions
 /// with Quill delta content) + words per-word .md files.
 class StorageService {
@@ -348,7 +357,7 @@ class StorageService {
                   : (e.value['title'] as String),
               (e.value['updatedAt'] as int?) ?? 0,
               folder: normalizeFolder(e.value['folder'] as String?),
-              videoUrl: (e.value['video'] as String?) ?? ''))
+              videoUrl: _cleanVideo(e.value['video'] as String?)))
           .toList()
         ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
       return list;
@@ -369,7 +378,7 @@ class StorageService {
               title == null || title.isEmpty ? 'Untitled' : title,
               (raw['updatedAt'] as int?) ?? 0,
               folder: normalizeFolder(raw['folder'] as String?),
-              videoUrl: (raw['video'] as String?) ?? ''));
+              videoUrl: _cleanVideo(raw['video'] as String?)));
         } catch (_) {
           continue;
         }

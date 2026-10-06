@@ -28,6 +28,7 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 dependencies:
+  file_picker: ^13.1.0
   flutter:
     sdk: flutter
   flutter_localizations:
@@ -36,12 +37,13 @@ dependencies:
   flutter_quill_extensions: ^11.0.0
   http: ^1.2.0
   image_picker: ^1.1.0
+  media_kit: ^1.2.6
+  media_kit_libs_video: ^1.0.7
+  media_kit_video: ^2.0.1
   path_provider: ^2.1.4
   spell_check_on_client: ^1.0.1
   url_launcher: ^6.3.0
   web: ^1.1.1
-  youtube_player_iframe: ^6.0.2
-
 dev_dependencies:
   flutter_test:
     sdk: flutter

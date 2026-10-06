@@ -30,15 +30,15 @@ import 'package:flutter_quill/flutter_quill.dart'
         StyleAttribute,
         getEmbedNode;
 import 'package:flutter_quill_extensions/flutter_quill_extensions.dart';
-import 'package:youtube_player_iframe/youtube_player_iframe.dart';
 
 import 'ai_service.dart';
 import 'clipboard_image.dart';
+import 'computer_video.dart';
+import 'computer_video_base.dart';
+import 'frame_link.dart';
 import 'grammar_check.dart';
 import 'graph_model.dart';
-import 'live_capture.dart';
 import 'storage.dart';
-import 'stream_video.dart';
 import 'tag_sheet.dart';
 import 'theme.dart';
 
@@ -228,28 +228,17 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   String? _aiKey; // null = not loaded yet
   bool _editingKey = false;
 
-  // Stream writing: one YouTube link per note, played inline.
-  final TextEditingController _videoCtrl = TextEditingController();
-
-  /// Reused for every frame-time dialog. Never disposed mid-flight, for the
-  /// same reason as _folderCtrl: the exiting route can still reference it.
-  final TextEditingController _frameTimeCtrl = TextEditingController();
-  YoutubePlayerController? _yt;
-  String? _ytId; // video id the live player holds, null = none
+  // Stream writing: one computer video file per note, floating player.
+  final ComputerVideoBase _video = ComputerVideo();
   bool _streamOpen = false; // panel expanded
   bool _frameBusy = false; // frame note being captured
+  bool _videoOpen = false; // player holds a playable file
+  bool _videoMissing = false; // attached ref that would not open
   // Floating player card (dragged around the sheet, never inside it).
   bool _playerHidden = false;
   bool _playerMini = false;
   double _playerRight = 16;
   double _playerBottom = 16;
-
-  // Live screen capture: one browser pick, then every frame note grabs
-  // exactly what the floating player shows (see live_capture.dart).
-  final LiveCapture _live = LiveCapture();
-  bool _liveOn = false;
-  bool _liveBusy = false;
-  final GlobalKey _playerAreaKey = GlobalKey();
   Offset _popupOffset = const Offset(0, 40);
   double _editorWidth = 600;
 
@@ -263,11 +252,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _quill.addListener(_onDocChanged);
     _titleCtrl.addListener(_onTitleChanged);
     listenClipboardImages(_onClipboardImage);
-    _live.onEnded = () {
-      if (!mounted) return;
-      setState(() => _liveOn = false);
-      _notice('Screen sharing stopped. Live capture is off.');
-    };
     _boot();
     _initSpell();
   }
@@ -432,11 +416,8 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
       final session =
           _sessions.firstWhere((s) => s.id == id);
       _titleCtrl.text = session.title;
-      _videoCtrl.text = session.videoUrl;
-      _loadPlayer(session.videoUrl);
-      _playerHidden = false;
-      _playerMini = false;
       setState(() => _activeId = id);
+      _openVideo(session.videoUrl);
     } catch (_) {
       _quill.document = Document();
     } finally {
@@ -1223,264 +1204,135 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     return null;
   }
 
-  /// Point the inline player at [url] (park it when empty/unparseable).
-  /// The real player only exists on web; elsewhere the note shows a
-  /// poster card until a desktop player lands.
-  void _loadPlayer(String url) {
-    final id = StreamVideo.parseId(url);
-    if (id == _ytId) return;
-    // A different video (or none): the old screen capture no longer
-    // matches anything, so park it.
-    _live.stop();
-    _liveOn = false;
-    final old = _yt;
-    _yt = null;
-    _ytId = null;
-    if (old != null) {
-      try {
-        old.close();
-      } catch (_) {}
-    }
-    if (id == null) return;
-    _ytId = id;
-    if (!kIsWeb) return;
-    try {
-      _yt = YoutubePlayerController.fromVideoId(
-        videoId: id,
-        params: const YoutubePlayerParams(
-          showFullscreenButton: true,
-          strictRelatedVideos: true,
-        ),
-      );
-    } catch (_) {
-      _yt = null;
-    }
+  /// Open this note's computer video (or park the player when none).
+  /// Fire-and-forget on purpose: the open touches real disk IO, which
+  /// must never be awaited on the UI path. Stale runs (rapid switches)
+  /// must not resurrect old players, hence the generation guard.
+  int _videoGen = 0;
+
+  void _openVideo(String ref) {
+    final gen = ++_videoGen;
+    final want = _activeId;
+    _video.close();
+    setState(() {
+      _videoOpen = false;
+      _videoMissing = false;
+      _playerHidden = false;
+      _playerMini = false;
+    });
+    if (ref.trim().isEmpty) return;
+    _video.openRef(ref).then((ok) {
+      if (!mounted || gen != _videoGen || _activeId != want) {
+        if (!ok) _video.close();
+        return;
+      }
+      setState(() {
+        _videoOpen = ok;
+        _videoMissing = !ok;
+      });
+    });
   }
 
-  Future<void> _attachVideo() async {
+  /// Test hook: pretend a file was attached (no native picker in tests).
+  @visibleForTesting
+  void debugAttachVideo(String ref) {
     final session = _activeSession();
     if (session == null) return;
-    final raw = _videoCtrl.text.trim();
-    final id = StreamVideo.parseId(raw);
-    if (id == null) {
-      _notice('That YouTube link did not parse. Paste a watch, share, '
-          'shorts or embed link.');
-      return;
-    }
-    session.videoUrl = raw;
+    session.videoUrl = ref;
+    _openVideo(ref);
+  }
+
+  /// Test hook: force the player UI state (the real open awaits disk IO,
+  /// which the widget sandbox cannot complete).
+  @visibleForTesting
+  void debugSetVideoState({required bool open, required bool missing}) {
     setState(() {
-      _streamOpen = true;
-      _playerHidden = false;
+      _videoOpen = open;
+      _videoMissing = missing;
     });
-    _loadPlayer(raw);
+  }
+
+  Future<void> _chooseVideo() async {
+    final session = _activeSession();
+    if (session == null) return;
+    PickedVideo? picked;
+    try {
+      picked = await _video.pick();
+    } catch (_) {}
+    if (picked == null) return; // cancelled
+    final ref = _video.store(picked);
+    session.videoUrl = ref;
+    setState(() => _streamOpen = true);
+    _openVideo(ref);
+    if (!mounted) return;
     await widget.storage.saveSession(
         session.id, _titleCtrl.text.trim(), _deltaJson(),
-        folder: session.folder, video: raw);
+        folder: session.folder, video: ref);
     if (mounted) setState(() {});
-    _notice('Video attached. Pause it anytime, then take a frame note.');
+    _notice('Video attached: ${FrameLink.basename(ref)}. Pause it '
+        'anytime, then frame note grabs that exact moment.');
   }
 
   Future<void> _removeVideo() async {
     final session = _activeSession();
     if (session == null) return;
     session.videoUrl = '';
-    _videoCtrl.text = '';
-    _loadPlayer('');
+    _video.close();
     await widget.storage.saveSession(
         session.id, _titleCtrl.text.trim(), _deltaJson(),
         folder: session.folder, video: '');
-    if (mounted) setState(() {});
-  }
-
-  /// One browser pick ("this tab"), then frame notes grab the screen until
-  /// sharing stops or the video changes. Cancelling keeps timestamp mode.
-  Future<void> _toggleLive() async {
-    if (_liveBusy) return;
-    if (_liveOn) {
-      _live.stop();
-      if (mounted) setState(() => _liveOn = false);
-      return;
-    }
-    if (_ytId == null) {
-      _notice('Attach a video first.');
-      return;
-    }
-    setState(() => _liveBusy = true);
-    try {
-      final ok = await _live.start();
-      if (!mounted) return;
-      setState(() => _liveOn = ok);
-      _notice(ok
-          ? 'Live capture on. Frame notes now grab the screen — pick THIS browser tab.'
-          : 'Capture cancelled. The timestamp still marks the second.');
-    } finally {
-      if (mounted) setState(() => _liveBusy = false);
+    if (mounted) {
+      setState(() {
+        _videoOpen = false;
+        _videoMissing = false;
+      });
     }
   }
 
-  /// The floating player's on-screen rect in CSS pixels (what tab capture
-  /// sees), or null when the card is hidden/mini-less area unavailable.
-  Rect? _playerCssRect() {
-    try {
-      final o =
-          _playerAreaKey.currentContext?.findRenderObject();
-      if (o is! RenderBox || !o.hasSize) return null;
-      final p = o.localToGlobal(Offset.zero);
-      return Rect.fromLTWH(p.dx, p.dy, o.size.width, o.size.height);
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// Hand-typed time for platforms with no inline player yet.
-  /// Null = cancelled, -1 = unparseable.
-  Future<int?> _askTimestamp() async {
-    _frameTimeCtrl.text = '';
-    final picked = await showDialog<int>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: const Color(0xFFF4EEDF),
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16)),
-        title: const Text('Frame time',
-            style: TextStyle(color: PaperTheme.ink, fontSize: 16)),
-        content: TextField(
-          controller: _frameTimeCtrl,
-          autofocus: true,
-          decoration: const InputDecoration(
-            hintText: 'mm:ss  (e.g. 4:07)',
-            hintStyle: TextStyle(color: PaperTheme.inkSoft),
-          ),
-          onSubmitted: (_) => Navigator.of(ctx)
-              .pop(_parseMmSs(_frameTimeCtrl.text) ?? -1),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel',
-                style: TextStyle(color: PaperTheme.inkSoft)),
-          ),
-          TextButton(
-            onPressed: () => Navigator.of(ctx)
-                .pop(_parseMmSs(_frameTimeCtrl.text) ?? -1),
-            child: const Text('Insert',
-                style: TextStyle(color: PaperTheme.ink)),
-          ),
-        ],
-      ),
-    );
-    return picked;
-  }
-
-  static int? _parseMmSs(String raw) {
-    final parts = raw.trim().split(':');
-    try {
-      if (parts.length == 1 && parts[0].isNotEmpty) {
-        final s = int.parse(parts[0]);
-        return s < 0 ? null : s;
-      }
-      if ((parts.length == 2 || parts.length == 3) &&
-          parts.every((p) => p.isNotEmpty)) {
-        var total = 0;
-        for (final p in parts) {
-          total = total * 60 + int.parse(p);
-        }
-        return total < 0 ? null : total;
-      }
-    } catch (_) {}
-    return null;
-  }
-
-  /// Freeze the paused moment into the note: poster still, a timestamp
+  /// Freeze the paused moment into the note: the exact frame, a timestamp
   /// label linked to that second, and a blank line to type under.
   Future<void> _takeFrameNote() async {
-    final videoId = _ytId;
-    if (videoId == null || _frameBusy) return;
+    final session = _activeSession();
+    final ref = (session?.videoUrl ?? '').trim();
+    if (ref.isEmpty || _frameBusy || !_videoOpen) {
+      if (ref.isNotEmpty && !_videoOpen && mounted) {
+        _notice(_videoMissing
+            ? 'Video file not found — choose it again.'
+            : 'Video is still loading. Give it a moment.');
+      }
+      return;
+    }
     setState(() => _frameBusy = true);
     try {
-      int seconds;
-      final ctl = _yt;
-      if (ctl != null) {
-        double? now;
-        try {
-          now = await ctl.currentTime;
-        } catch (_) {}
-        if (now == null) {
-          _notice('The player did not report a time yet. Let the video '
-              'play a moment, pause it, then try again.');
-          return;
-        }
-        seconds = now.floor();
-      } else {
-        // No inline player on this platform: time the frame by hand.
-        final picked = await _askTimestamp();
-        if (picked == null) return; // cancelled
-        if (picked < 0) {
-          _notice('Use mm:ss, e.g. 4:07.');
-          return;
-        }
-        seconds = picked;
-      }
-      // Live capture first: the exact pixels on screen at this second.
+      final seconds = _video.currentSeconds();
       String? shot;
-      String? problem;
-      if (_liveOn) {
-        if (!_live.live) {
-          problem = 'ended';
-        } else {
-          final rect = _playerCssRect();
-          if (rect == null) {
-            problem = 'hidden';
-          } else {
-            try {
-              shot = await _live.grab(
-                  rect.left, rect.top, rect.width, rect.height);
-            } catch (_) {}
-            if (shot == null) problem = 'grab';
-          }
-        }
-      }
-      if (shot != null) {
-        _insertFrameNote(videoId, seconds, imageUrl: shot);
-        _notice('Frame captured from the screen.');
-      } else {
-        if (problem == 'ended' && mounted) {
-          setState(() => _liveOn = false);
-        }
-        _insertFrameNote(videoId, seconds);
-        if (problem == 'hidden') {
-          _notice('Moment marked. Show the player card so live '
-              'capture can see it.');
-        } else if (problem == 'ended') {
-          _notice('Moment marked. Capture had ended — re-enable '
-              'live capture or snip + Ctrl+V.');
-        } else if (_liveOn) {
-          _notice('Moment marked. The grab missed — share THIS '
-              'browser tab, or snip + Ctrl+V.');
-        } else {
-          _notice('Moment marked. Snip it '
-              '(Win+Shift+S), then Ctrl+V in the note for the true frame.');
-        }
-      }
+      try {
+        shot = await _video.captureFrame();
+      } catch (_) {}
+      _insertFrameNote(seconds, imageUrl: shot);
       _focusNode.requestFocus();
+      _notice(shot != null
+          ? 'Frame captured.'
+          : 'Moment marked. On this device add the picture with a snip + paste.');
     } finally {
       if (mounted) setState(() => _frameBusy = false);
     }
   }
 
-  void _insertFrameNote(String videoId, int seconds,
-      {String? imageUrl}) {
+  void _insertFrameNote(int seconds, {String? imageUrl}) {
     try {
-      final label = '⏱ ${StreamVideo.formatTime(seconds)}';
-      final url = StreamVideo.timestampUrl(videoId, seconds);
+      final label = '⏱ ${FrameLink.formatTime(seconds)}';
+      final url = FrameLink.at(seconds);
       final docLen = _quill.document.length;
       var idx = _quill.selection.isValid
           ? _quill.selection.baseOffset
           : docLen;
       if (idx < 0 || idx > docLen) idx = docLen;
-      _quill.document.insert(idx,
-          BlockEmbed.image(imageUrl ?? StreamVideo.thumbnail(videoId)));
-      var at = idx + 1;
+      var at = idx;
+      if (imageUrl != null) {
+        _quill.document.insert(at, BlockEmbed.image(imageUrl));
+        at += 1;
+      }
       _quill.document.insert(at, '\n$label ');
       _quill.formatText(at + 1, label.length, LinkAttribute(url));
       at += 1 + label.length + 1;
@@ -1491,17 +1343,17 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     }
   }
 
-  /// Timestamp labels for this note's video seek the inline player;
-  /// every other link opens outside the app.
+  /// Frame-note labels seek this note's player; legacy YouTube labels and
+  /// every other link open outside the app.
   Future<void> _onEditorLink(String url) async {
     try {
-      final id = StreamVideo.parseId(url);
-      final t = StreamVideo.timestampOf(url);
-      final ctl = _yt;
-      if (id != null && t != null && id == _ytId && ctl != null) {
-        setState(() => _streamOpen = true);
-        await ctl.seekTo(
-            seconds: t.toDouble(), allowSeekAhead: true);
+      final fs = FrameLink.secondsOf(url);
+      if (fs != null && _videoOpen) {
+        setState(() {
+          _streamOpen = true;
+          _playerHidden = false;
+        });
+        await _video.seekTo(fs);
         return;
       }
       await launchUrl(Uri.parse(url),
@@ -1534,13 +1386,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _aiQ.dispose();
     _aiKeyField.dispose();
     _aiClient.dispose();
-    _videoCtrl.dispose();
-    _frameTimeCtrl.dispose();
-    _live.stop();
-    try {
-      _yt?.close();
-    } catch (_) {}
-    _yt = null;
+    _video.close();
     _removeOverlay();
     WidgetsBinding.instance.removeObserver(this);
     _quill.removeListener(_onDocChanged);
@@ -2194,124 +2040,51 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   }
 
   /// #word chooser: ban the typed word or put it on the map.
-  /// @ai mini-chat card. Stateless across opens: closing discards all.
-  /// Inline player for this note's video, with a loading veil and an
-  /// honest fallback when the video refuses to load (tap opens YouTube).
-  /// No inline player exists off-web yet: there the poster card shows.
+  /// This note's computer video in the floating card, or a missing-file
+  /// card when the attached file cannot be opened anymore.
   Widget _buildPlayer() {
-    final ctl = _yt;
-    final id = _ytId;
-    if (id == null) return const SizedBox.shrink();
-    if (ctl == null) return _posterCard(id);
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(8),
-      child: AspectRatio(
-        aspectRatio: 16 / 9,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            YoutubePlayer(controller: ctl),
-            YoutubeValueBuilder(
-              controller: ctl,
-              builder: (context, value) {
-                if (value.hasError) {
-                  return _posterCard(id, loadError: true);
-                }
-                if (value.playerState == PlayerState.unknown) {
-                  return IgnorePointer(
-                    child: Container(
-                      color: const Color(0xFFEFE8D6),
-                      child: const Center(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2),
-                            ),
-                            SizedBox(height: 6),
-                            Text('loading video…',
-                                style: TextStyle(
-                                    color: PaperTheme.inkSoft,
-                                    fontSize: 11)),
-                          ],
-                        ),
-                      ),
-                    ),
-                  );
-                }
-                return const SizedBox.shrink();
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Poster still that opens the video outside the app.
-  Widget _posterCard(String id, {bool loadError = false}) {
-    return InkWell(
-      onTap: () {
-        try {
-          launchUrl(Uri.parse('https://youtu.be/$id'),
-              mode: LaunchMode.externalApplication);
-        } catch (_) {}
-      },
-      borderRadius: BorderRadius.circular(8),
-      child: Container(
+    if (!_videoOpen) {
+      if (!_videoMissing) return const SizedBox.shrink();
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
         decoration: BoxDecoration(
           border: Border.all(color: PaperTheme.lineThin),
           borderRadius: BorderRadius.circular(8),
         ),
-        child: Stack(
-          alignment: Alignment.center,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(7),
-              child: Image.network(
-                StreamVideo.thumbnail(id),
-                fit: BoxFit.cover,
-                width: double.infinity,
-                errorBuilder: (_, _, _) => const SizedBox(
-                    height: 120,
-                    child: Center(
-                        child: Icon(Icons.movie_outlined,
-                            color: PaperTheme.inkSoft))),
-              ),
+            const Icon(Icons.movie_outlined,
+                size: 26, color: PaperTheme.inkSoft),
+            const SizedBox(height: 6),
+            Text(
+              '${FrameLink.basename(_activeSession()?.videoUrl ?? '')} not found',
+              textAlign: TextAlign.center,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 2,
+              style: const TextStyle(
+                  color: PaperTheme.inkSoft, fontSize: 11),
             ),
-            Container(
-              padding: const EdgeInsets.symmetric(
-                  horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(
-                color: const Color(0xFFF4EEDF).withValues(alpha: 0.92),
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.play_arrow,
-                      size: 14, color: PaperTheme.ink),
-                  const SizedBox(width: 4),
-                  Text(
-                      loadError
-                          ? 'tap to open in YouTube'
-                          : 'open in YouTube',
-                      style: const TextStyle(
-                          color: PaperTheme.inkSoft,
-                          fontSize: 10.5)),
-                ],
-              ),
+            TextButton(
+              onPressed: _chooseVideo,
+              child: const Text('choose file',
+                  style: TextStyle(
+                      color: PaperTheme.ink, fontSize: 12)),
             ),
           ],
         ),
+      );
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: AspectRatio(
+        aspectRatio: 16 / 9,
+        child: _video.buildPlayer(),
       ),
     );
   }
 
-  /// The stream video as a draggable card floating OVER the sheet, so
+  /// The note's video as a draggable card floating OVER the sheet, so
   /// the note keeps its full height no matter the video size. Drag the
   /// header to move it; frame/collapse/hide live in the header too.
   Widget _buildFloatingCard(double maxWidth) {
@@ -2354,10 +2127,12 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                 children: [
                   const Icon(Icons.drag_indicator,
                       size: 14, color: PaperTheme.inkSoft),
-                  const Expanded(
-                    child: Text('now playing',
+                  Expanded(
+                    child: Text(
+                        FrameLink.basename(
+                            _activeSession()?.videoUrl ?? ''),
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
+                        style: const TextStyle(
                             color: PaperTheme.inkSoft,
                             fontSize: 11)),
                   ),
@@ -2368,30 +2143,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                       padding: EdgeInsets.all(4),
                       child: Icon(Icons.photo_camera_outlined,
                           size: 15, color: PaperTheme.ink),
-                    ),
-                  ),
-                  InkWell(
-                    onTap: (_liveBusy || _frameBusy)
-                        ? null
-                        : _toggleLive,
-                    borderRadius: BorderRadius.circular(10),
-                    child: Padding(
-                      padding: const EdgeInsets.all(4),
-                      child: _liveBusy
-                          ? const SizedBox(
-                              width: 15,
-                              height: 15,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2),
-                            )
-                          : Icon(
-                              _liveOn
-                                  ? Icons.videocam
-                                  : Icons.videocam_outlined,
-                              size: 15,
-                              color: _liveOn
-                                  ? const Color(0xFFB3261E)
-                                  : PaperTheme.ink),
                     ),
                   ),
                   InkWell(
@@ -2425,7 +2176,6 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
           ),
           if (!_playerMini)
             Padding(
-              key: _playerAreaKey,
               padding: const EdgeInsets.all(8),
               child: _buildPlayer(),
             ),
@@ -2494,30 +2244,25 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                 children: [
                   Row(
                     children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _videoCtrl,
-                          style: const TextStyle(
-                              color: PaperTheme.ink, fontSize: 12.5),
-                          cursorColor: PaperTheme.ink,
-                          decoration: const InputDecoration(
-                            hintText: 'Paste a YouTube link…',
-                            hintStyle: TextStyle(
-                                color: PaperTheme.inkSoft),
-                            border: InputBorder.none,
-                            isDense: true,
-                            contentPadding: EdgeInsets.symmetric(
-                                vertical: 4),
-                          ),
-                          onSubmitted: (_) => _attachVideo(),
-                        ),
-                      ),
                       TextButton(
-                        onPressed: _attachVideo,
-                        child: Text(attached ? 'Change' : 'Attach',
+                        onPressed: _chooseVideo,
+                        child: Text(
+                            attached ? 'Change file…' : 'Choose file…',
                             style: const TextStyle(
                                 color: PaperTheme.ink,
                                 fontSize: 12)),
+                      ),
+                      Expanded(
+                        child: Text(
+                          attached
+                              ? FrameLink.basename(
+                                  _activeSession()?.videoUrl ?? '')
+                              : 'no video attached',
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              color: PaperTheme.inkSoft,
+                              fontSize: 12),
+                        ),
                       ),
                       if (attached)
                         TextButton(
@@ -2582,28 +2327,14 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                         ),
                         const SizedBox(width: 8),
                         Expanded(
-                          child: Column(
-                            crossAxisAlignment:
-                                CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Text(
-                                'pause the video, then frame the moment',
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                    color: PaperTheme.inkSoft,
-                                    fontSize: 10.5),
-                              ),
-                              if (kIsWeb)
-                                const Text(
-                                  'tip: Win+Shift+S, then Ctrl+V here pastes the true frame',
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(
-                                      color: PaperTheme.inkSoft,
-                                      fontSize: 10.5,
-                                      fontStyle: FontStyle.italic),
-                                ),
-                            ],
+                          child: Text(
+                            kIsWeb
+                                ? 'pause, then frame note grabs the exact moment'
+                                : 'pause, then frame note marks the moment',
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: PaperTheme.inkSoft,
+                                fontSize: 10.5),
                           ),
                         ),
                       ],
@@ -2646,49 +2377,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                           ),
                       ],
                     ),
-                    const SizedBox(height: 2),
-                    Row(
-                      children: [
-                        Icon(
-                            _liveOn
-                                ? Icons.videocam
-                                : Icons.videocam_outlined,
-                            size: 13,
-                            color: _liveOn
-                                ? const Color(0xFFB3261E)
-                                : PaperTheme.inkSoft),
-                        const SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            _liveOn
-                                ? 'live capture on — frame notes grab the screen'
-                                : 'live capture: one browser pick, then instant frames',
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                                color: PaperTheme.inkSoft,
-                                fontSize: 10.5),
-                          ),
-                        ),
-                        if (_liveBusy)
-                          const SizedBox(
-                            width: 12,
-                            height: 12,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2),
-                          )
-                        else
-                          TextButton(
-                            onPressed: _toggleLive,
-                            child: Text(
-                                _liveOn ? 'stop' : 'enable',
-                                style: TextStyle(
-                                    color: _liveOn
-                                        ? PaperTheme.inkSoft
-                                        : PaperTheme.ink,
-                                    fontSize: 12)),
-                          ),
-                      ],
-                    ),
+                    // (screen-share live capture retired with YouTube.)
                   ],
                 ],
               ),
@@ -3622,7 +3311,10 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                     ),
                   ),
                 ),
-                    if (_ytId != null && !_playerHidden)
+                    if ((_activeSession()?.videoUrl ?? '')
+                            .trim()
+                            .isNotEmpty &&
+                        !_playerHidden)
                       Positioned(
                         right: _playerRight,
                         bottom: _playerBottom,

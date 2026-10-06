@@ -18,9 +18,9 @@ import 'package:word_graph_tool/sheet_view.dart'
         countWords,
         findGraphMatches,
         findUnknownRanges;
-import 'package:word_graph_tool/live_capture.dart';
+import 'package:word_graph_tool/computer_video.dart';
 import 'package:word_graph_tool/storage.dart';
-import 'package:word_graph_tool/stream_video.dart';
+import 'package:word_graph_tool/frame_link.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
 
 void main() {
@@ -80,74 +80,55 @@ void main() {
     expect(back[1].category, 'Conditionals');
   });
 
-  test('stream video ids parse from every link shape', () {
-    const id = 'dQw4w9WgXcQ';
-    expect(StreamVideo.parseId(id), id);
-    expect(
-        StreamVideo.parseId('https://www.youtube.com/watch?v=$id'),
-        id);
-    expect(
-        StreamVideo.parseId('https://youtu.be/$id?t=277'), id);
-    expect(
-        StreamVideo.parseId('https://www.youtube.com/shorts/$id'),
-        id);
-    expect(
-        StreamVideo.parseId(
-            'https://www.youtube.com/embed/$id?start=10'),
-        id);
-    expect(
-        StreamVideo.parseId('https://www.youtube.com/live/$id'),
-        id);
-    expect(StreamVideo.parseId('https://example.com/nothing'),
-        isNull);
-    expect(StreamVideo.parseId('not a link at all'), isNull);
-    expect(StreamVideo.parseId(''), isNull);
+  test('frame labels format and seek links round-trip', () {
+    expect(FrameLink.formatTime(0), '0:00');
+    expect(FrameLink.formatTime(67), '1:07');
+    expect(FrameLink.formatTime(277), '4:37');
+    expect(FrameLink.formatTime(3723), '1:02:03');
+    final url = FrameLink.at(277);
+    expect(url, 'streamframe://frame?t=277');
+    expect(FrameLink.secondsOf(url), 277);
+    expect(FrameLink.secondsOf('https://youtu.be/x?t=277'), isNull);
+    expect(FrameLink.secondsOf('streamframe://t=abc'), isNull);
+    expect(FrameLink.secondsOf('not a link'), isNull);
+    expect(FrameLink.basename(r'C:\Vids\talk.mp4'), 'talk.mp4');
+    expect(FrameLink.basename('/home/u/talk.mp4'), 'talk.mp4');
+    expect(FrameLink.basename('talk.mp4'), 'talk.mp4');
+    expect(FrameLink.isLegacyLink('https://youtu.be/x'), isTrue);
+    expect(FrameLink.isLegacyLink(r'C:\Vids\talk.mp4'), isFalse);
+    expect(FrameLink.isLegacyLink('talk.mp4'), isFalse);
   });
 
-  test('stream timestamps format and round-trip', () {
-    expect(StreamVideo.formatTime(0), '0:00');
-    expect(StreamVideo.formatTime(67), '1:07');
-    expect(StreamVideo.formatTime(277), '4:37');
-    expect(StreamVideo.formatTime(3723), '1:02:03');
-    const id = 'dQw4w9WgXcQ';
-    final url = StreamVideo.timestampUrl(id, 277);
-    expect(url, contains(id));
-    expect(StreamVideo.timestampOf(url), 277);
-    expect(StreamVideo.parseId(url), id);
-    expect(StreamVideo.timestampOf('https://youtu.be/$id?t=1h2m3s'),
-        3723);
-    expect(StreamVideo.timestampOf('https://youtu.be/$id'), isNull);
-    expect(
-        StreamVideo.thumbnail(id),
-        'https://img.youtube.com/vi/$id/hqdefault.jpg');
-  });
-
-  test('session video links save and survive plain saves', () async {
+  test('session video files save and survive plain saves', () async {
     final s = StorageService();
     await s.init();
     await s.saveSession('n1', 'Stream note', '[]');
     var sessions = await s.loadSessions();
     expect(sessions.single.videoUrl, '');
     await s.saveSession('n1', 'Stream note', '[]',
-        video: 'https://youtu.be/dQw4w9WgXcQ');
+        video: r'C:\Vids\talk.mp4');
     sessions = await s.loadSessions();
-    expect(sessions.single.videoUrl,
-        'https://youtu.be/dQw4w9WgXcQ');
-    // A content save that says nothing about video keeps the link.
+    expect(sessions.single.videoUrl, r'C:\Vids\talk.mp4');
+    // A content save that says nothing about video keeps the file.
     await s.saveSession('n1', 'Stream note v2', '[]');
     sessions = await s.loadSessions();
     expect(sessions.single.title, 'Stream note v2');
-    expect(sessions.single.videoUrl,
-        'https://youtu.be/dQw4w9WgXcQ');
+    expect(sessions.single.videoUrl, r'C:\Vids\talk.mp4');
+    // Leftover YouTube links from the retired flow load as empty.
+    await s.saveSession('n1', 'Stream note', '[]',
+        video: 'https://youtu.be/dQw4w9WgXcQ');
+    sessions = await s.loadSessions();
+    expect(sessions.single.videoUrl, '');
   });
 
-  test('live capture stays off outside the browser', () async {
-    final cap = LiveCapture();
-    expect(cap.live, isFalse);
-    expect(await cap.start(), isFalse);
-    expect(await cap.grab(0, 0, 100, 100), isNull);
-    cap.stop(); // must not throw
-    expect(cap.live, isFalse);
+  test('computer video degrades safely with no file', () async {
+    final v = ComputerVideo();
+    expect(v.currentSeconds(), 0);
+    expect(await v.captureFrame(), isNull);
+    expect(await v.openRef(r'C:\definitely\missing\talk.mp4'),
+        isFalse);
+    v.close(); // must not throw
+    expect(v.displayName(r'C:\Vids\talk.mp4'), 'talk.mp4');
   });
 
   test('groq request is well-formed', () {
@@ -679,6 +660,65 @@ void main() {
     expect(state.debugEdgeMid('meal', 'eat'), isNull);
   });
 
+  testWidgets('graph board has no walls: far drags keep exact spots',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('Graph'));
+    await tester.pump(const Duration(milliseconds: 500));
+    final state =
+        tester.state<GraphViewState>(find.byType(GraphView).first);
+    final start = state.debugCenter('meal')!;
+    final gesture =
+        await tester.startGesture(state.debugToGlobal(start));
+    // Far past the old 40..5600 walls, into negative space.
+    await gesture.moveBy(const Offset(-2000, -1500));
+    await tester.pump(const Duration(milliseconds: 100));
+    await gesture.up();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    final node = state.widget.graph.get('meal')!;
+    expect(node.x, closeTo(start.dx - 2000, 2.0));
+    expect(node.y, closeTo(start.dy - 1500, 2.0));
+  });
+
+  testWidgets('fit button centers a huge spread instead of stranding it',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('Graph'));
+    await tester.pump(const Duration(milliseconds: 500));
+    final state =
+        tester.state<GraphViewState>(find.byType(GraphView).first);
+    // Hurl one word far out so fitting needs a deep zoom-out.
+    final start = state.debugCenter('meal')!;
+    final gesture =
+        await tester.startGesture(state.debugToGlobal(start));
+    await gesture.moveBy(const Offset(-8000, 0));
+    await tester.pump(const Duration(milliseconds: 100));
+    await gesture.up();
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.tap(find.byTooltip('Fit everything in view'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    // Deep zoom-out, past the old 0.2 floor, still above the basement.
+    final s = state.debugScale();
+    expect(s, lessThan(0.19));
+    expect(s, greaterThanOrEqualTo(0.05));
+    // The middle of the map lands near the middle of the canvas area
+    // (right of the 208px word rail in the 800px test window).
+    final a = state.debugCenter('meal')!;
+    final b = state.debugCenter('eat')!;
+    final mid = Offset((a.dx + b.dx) / 2, (a.dy + b.dy) / 2);
+    final onScreen = state.debugToGlobal(mid);
+    expect((onScreen.dx - 504).abs(), lessThan(200));
+    expect((onScreen.dy - 300).abs(), lessThan(200));
+  });
+
   testWidgets('dragged word stays exactly where dropped',
       (WidgetTester tester) async {
     await tester.pumpWidget(const WordGraphToolApp());
@@ -834,81 +874,33 @@ void main() {
     expect(find.text('Conditionals (1)'), findsOneWidget);
   });
 
-  /// Test sandbox has no real network: poster/thumbnail images 400, and
-  /// their late async errors would poison whichever test runs next.
-  void swallowImageErrors() {
-    final old = FlutterError.onError;
-    FlutterError.onError = (details) {
-      if (details.exception is NetworkImageLoadException) return;
-      old?.call(details);
-    };
-    addTearDown(() => FlutterError.onError = old);
-  }
-
-  testWidgets('stream panel attaches a video link to the note',
+  testWidgets('stream panel offers a file and reports it missing',
       (WidgetTester tester) async {
-    swallowImageErrors();
     await tester.pumpWidget(const WordGraphToolApp());
     await tester.pump(const Duration(seconds: 5));
     await tester.pump(const Duration(seconds: 5));
     await tester.tap(find.text('stream video'));
     await tester.pump(const Duration(milliseconds: 800));
-    await tester.enterText(
-        find.byWidgetPredicate((w) =>
-            w is TextField &&
-            (w.decoration?.hintText ?? '')
-                .startsWith('Paste a YouTube link')),
-        'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
-    await tester.pump(const Duration(milliseconds: 300));
-    await tester.tap(find.text('Attach'));
+    expect(find.text('Choose file…'), findsOneWidget);
+    expect(find.text('no video attached'), findsOneWidget);
+    // No native picker or disk IO in tests: attach directly, then force
+    // the player states to see each card.
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .debugAttachVideo(r'C:\Vids\gone.mp4');
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(const Duration(milliseconds: 500));
-    // No inline player off-web: the poster card offers YouTube outside.
-    expect(find.textContaining('open in YouTube'), findsOneWidget);
+    expect(find.text('gone.mp4'), findsNWidgets(2));
+    tester
+        .state<SheetViewState>(find.byType(SheetView))
+        .debugSetVideoState(open: false, missing: true);
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.textContaining('not found'), findsOneWidget);
     expect(find.text('frame note'), findsOneWidget);
     await tester.tap(find.text('Remove'));
     await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(const Duration(milliseconds: 500));
-    expect(find.textContaining('open in YouTube'), findsNothing);
-  });
-
-  testWidgets('frame note inserts timestamp label at typed time',
-      (WidgetTester tester) async {
-    swallowImageErrors();
-    await tester.pumpWidget(const WordGraphToolApp());
-    await tester.pump(const Duration(seconds: 5));
-    await tester.pump(const Duration(seconds: 5));
-    await tester.tap(find.text('stream video'));
-    await tester.pump(const Duration(milliseconds: 800));
-    await tester.enterText(
-        find.byWidgetPredicate((w) =>
-            w is TextField &&
-            (w.decoration?.hintText ?? '')
-                .startsWith('Paste a YouTube link')),
-        'https://youtu.be/dQw4w9WgXcQ');
-    await tester.pump(const Duration(milliseconds: 300));
-    await tester.tap(find.text('Attach'));
-    await tester.pump(const Duration(milliseconds: 500));
-    await tester.pump(const Duration(milliseconds: 500));
-    // Off-web there is no live player clock: the time is typed by hand.
-    await tester.tap(find.text('frame note'));
-    await tester.pump(const Duration(milliseconds: 500));
-    expect(find.text('Frame time'), findsOneWidget);
-    await tester.enterText(
-        find.byWidgetPredicate((w) =>
-            w is TextField &&
-            (w.decoration?.hintText ?? '').startsWith('mm:ss')),
-        '0:07');
-    await tester.pump(const Duration(milliseconds: 300));
-    await tester.tap(find.text('Insert'));
-    await tester.pump(const Duration(milliseconds: 500));
-    await tester.pump(const Duration(milliseconds: 500));
-    // Quill renders lines as RichText spans, not Text widgets.
-    expect(
-        find.byWidgetPredicate((w) =>
-            w is RichText &&
-            w.text.toPlainText().contains('0:07')),
-        findsOneWidget);
+    expect(find.text('no video attached'), findsOneWidget);
   });
 
   testWidgets('app boots to sheet view', (WidgetTester tester) async {
