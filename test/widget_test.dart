@@ -18,7 +18,9 @@ import 'package:word_graph_tool/sheet_view.dart'
         countWords,
         findGraphMatches,
         findUnknownRanges;
+import 'package:word_graph_tool/live_capture.dart';
 import 'package:word_graph_tool/storage.dart';
+import 'package:word_graph_tool/stream_video.dart';
 import 'package:word_graph_tool/tag_sheet.dart';
 
 void main() {
@@ -76,6 +78,76 @@ void main() {
     expect(back.first.checked, isTrue);
     expect(back[1].checked, isFalse);
     expect(back[1].category, 'Conditionals');
+  });
+
+  test('stream video ids parse from every link shape', () {
+    const id = 'dQw4w9WgXcQ';
+    expect(StreamVideo.parseId(id), id);
+    expect(
+        StreamVideo.parseId('https://www.youtube.com/watch?v=$id'),
+        id);
+    expect(
+        StreamVideo.parseId('https://youtu.be/$id?t=277'), id);
+    expect(
+        StreamVideo.parseId('https://www.youtube.com/shorts/$id'),
+        id);
+    expect(
+        StreamVideo.parseId(
+            'https://www.youtube.com/embed/$id?start=10'),
+        id);
+    expect(
+        StreamVideo.parseId('https://www.youtube.com/live/$id'),
+        id);
+    expect(StreamVideo.parseId('https://example.com/nothing'),
+        isNull);
+    expect(StreamVideo.parseId('not a link at all'), isNull);
+    expect(StreamVideo.parseId(''), isNull);
+  });
+
+  test('stream timestamps format and round-trip', () {
+    expect(StreamVideo.formatTime(0), '0:00');
+    expect(StreamVideo.formatTime(67), '1:07');
+    expect(StreamVideo.formatTime(277), '4:37');
+    expect(StreamVideo.formatTime(3723), '1:02:03');
+    const id = 'dQw4w9WgXcQ';
+    final url = StreamVideo.timestampUrl(id, 277);
+    expect(url, contains(id));
+    expect(StreamVideo.timestampOf(url), 277);
+    expect(StreamVideo.parseId(url), id);
+    expect(StreamVideo.timestampOf('https://youtu.be/$id?t=1h2m3s'),
+        3723);
+    expect(StreamVideo.timestampOf('https://youtu.be/$id'), isNull);
+    expect(
+        StreamVideo.thumbnail(id),
+        'https://img.youtube.com/vi/$id/hqdefault.jpg');
+  });
+
+  test('session video links save and survive plain saves', () async {
+    final s = StorageService();
+    await s.init();
+    await s.saveSession('n1', 'Stream note', '[]');
+    var sessions = await s.loadSessions();
+    expect(sessions.single.videoUrl, '');
+    await s.saveSession('n1', 'Stream note', '[]',
+        video: 'https://youtu.be/dQw4w9WgXcQ');
+    sessions = await s.loadSessions();
+    expect(sessions.single.videoUrl,
+        'https://youtu.be/dQw4w9WgXcQ');
+    // A content save that says nothing about video keeps the link.
+    await s.saveSession('n1', 'Stream note v2', '[]');
+    sessions = await s.loadSessions();
+    expect(sessions.single.title, 'Stream note v2');
+    expect(sessions.single.videoUrl,
+        'https://youtu.be/dQw4w9WgXcQ');
+  });
+
+  test('live capture stays off outside the browser', () async {
+    final cap = LiveCapture();
+    expect(cap.live, isFalse);
+    expect(await cap.start(), isFalse);
+    expect(await cap.grab(0, 0, 100, 100), isNull);
+    cap.stop(); // must not throw
+    expect(cap.live, isFalse);
   });
 
   test('groq request is well-formed', () {
@@ -760,6 +832,83 @@ void main() {
     expect(find.text('If I had known, I would have come.'),
         findsOneWidget);
     expect(find.text('Conditionals (1)'), findsOneWidget);
+  });
+
+  /// Test sandbox has no real network: poster/thumbnail images 400, and
+  /// their late async errors would poison whichever test runs next.
+  void swallowImageErrors() {
+    final old = FlutterError.onError;
+    FlutterError.onError = (details) {
+      if (details.exception is NetworkImageLoadException) return;
+      old?.call(details);
+    };
+    addTearDown(() => FlutterError.onError = old);
+  }
+
+  testWidgets('stream panel attaches a video link to the note',
+      (WidgetTester tester) async {
+    swallowImageErrors();
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('stream video'));
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.enterText(
+        find.byWidgetPredicate((w) =>
+            w is TextField &&
+            (w.decoration?.hintText ?? '')
+                .startsWith('Paste a YouTube link')),
+        'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Attach'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    // No inline player off-web: the poster card offers YouTube outside.
+    expect(find.textContaining('open in YouTube'), findsOneWidget);
+    expect(find.text('frame note'), findsOneWidget);
+    await tester.tap(find.text('Remove'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.textContaining('open in YouTube'), findsNothing);
+  });
+
+  testWidgets('frame note inserts timestamp label at typed time',
+      (WidgetTester tester) async {
+    swallowImageErrors();
+    await tester.pumpWidget(const WordGraphToolApp());
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.tap(find.text('stream video'));
+    await tester.pump(const Duration(milliseconds: 800));
+    await tester.enterText(
+        find.byWidgetPredicate((w) =>
+            w is TextField &&
+            (w.decoration?.hintText ?? '')
+                .startsWith('Paste a YouTube link')),
+        'https://youtu.be/dQw4w9WgXcQ');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Attach'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    // Off-web there is no live player clock: the time is typed by hand.
+    await tester.tap(find.text('frame note'));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Frame time'), findsOneWidget);
+    await tester.enterText(
+        find.byWidgetPredicate((w) =>
+            w is TextField &&
+            (w.decoration?.hintText ?? '').startsWith('mm:ss')),
+        '0:07');
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Insert'));
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 500));
+    // Quill renders lines as RichText spans, not Text widgets.
+    expect(
+        find.byWidgetPredicate((w) =>
+            w is RichText &&
+            w.text.toPlainText().contains('0:07')),
+        findsOneWidget);
   });
 
   testWidgets('app boots to sheet view', (WidgetTester tester) async {

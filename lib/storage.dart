@@ -12,8 +12,11 @@ class WritingSession {
   String title;
   String folder;
   int updatedAt;
+
+  /// Attached stream-writing video (YouTube link), or '' for none.
+  String videoUrl;
   WritingSession(this.id, this.title, this.updatedAt,
-      {this.folder = 'Notes'});
+      {this.folder = 'Notes', this.videoUrl = ''});
 }
 
 /// One reference sentence on the grammar page.
@@ -344,7 +347,8 @@ class StorageService {
                   ? 'Untitled'
                   : (e.value['title'] as String),
               (e.value['updatedAt'] as int?) ?? 0,
-              folder: normalizeFolder(e.value['folder'] as String?)))
+              folder: normalizeFolder(e.value['folder'] as String?),
+              videoUrl: (e.value['video'] as String?) ?? ''))
           .toList()
         ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
       return list;
@@ -364,7 +368,8 @@ class StorageService {
               id,
               title == null || title.isEmpty ? 'Untitled' : title,
               (raw['updatedAt'] as int?) ?? 0,
-              folder: normalizeFolder(raw['folder'] as String?)));
+              folder: normalizeFolder(raw['folder'] as String?),
+              videoUrl: (raw['video'] as String?) ?? ''));
         } catch (_) {
           continue;
         }
@@ -390,15 +395,17 @@ class StorageService {
   }
 
   Future<void> saveSession(String id, String title, String deltaJson,
-      {String folder = 'Notes'}) async {
+      {String folder = 'Notes', String? video}) async {
     final now = DateTime.now().millisecondsSinceEpoch;
     final cleanFolder = normalizeFolder(folder);
+    final videoUrl = video ?? await _existingVideo(id);
     if (_sheetsDir == null) {
       _memorySessions[id] = {
         'title': title,
         'updatedAt': now,
         'delta': deltaJson,
         'folder': cleanFolder,
+        'video': videoUrl,
       };
       return;
     }
@@ -408,6 +415,7 @@ class StorageService {
         'updatedAt': now,
         'delta': deltaJson,
         'folder': cleanFolder,
+        'video': videoUrl,
       });
       final file = File(_sessionFile(id));
       // Rotate a backup first: if anything ever writes a bad version,
@@ -424,6 +432,23 @@ class StorageService {
       await file.writeAsString(content);
     } catch (_) {
       // Silent: never interrupt typing for IO errors.
+    }
+  }
+
+  /// Video link already stored for [id] (so plain content saves that do
+  /// not mention video never wipe an attached link).
+  Future<String> _existingVideo(String id) async {
+    try {
+      if (_sheetsDir == null) {
+        return (_memorySessions[id]?['video'] as String?) ?? '';
+      }
+      final file = File(_sessionFile(id));
+      if (!await file.exists()) return '';
+      final raw =
+          jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      return (raw['video'] as String?) ?? '';
+    } catch (_) {
+      return '';
     }
   }
 

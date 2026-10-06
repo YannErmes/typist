@@ -39,6 +39,8 @@ dependencies:
   path_provider: ^2.1.4
   spell_check_on_client: ^1.0.1
   url_launcher: ^6.3.0
+  web: ^1.1.1
+  youtube_player_iframe: ^6.0.2
 
 dev_dependencies:
   flutter_test:
