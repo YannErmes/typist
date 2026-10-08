@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'frame_link.dart';
@@ -186,6 +187,41 @@ class StorageService {
     }
   }
 
+  /// Pure part of [saveImageBytes]: builds the portable reference. Anything
+  /// that is not a plain lowercase name is replaced, so a crafted prefix
+  /// or extension cannot walk out of the images folder.
+  @visibleForTesting
+  static String imageRefName(String prefix, String ext, int stamp) {
+    final safePrefix =
+        RegExp(r'^[a-z0-9]{1,20}$').hasMatch(prefix) ? prefix : 'image';
+    final safeExt = RegExp(r'^[a-z0-9]{2,5}$').hasMatch(ext) ? ext : 'jpg';
+    return 'images/$safePrefix-$stamp.$safeExt';
+  }
+
+  /// Store already-encoded image bytes (e.g. a grabbed video frame) in
+  /// the local images folder. Returns the portable `images/<name>`
+  /// reference to embed in a document, or null on failure.
+  Future<String?> saveImageBytes(
+    List<int> bytes, {
+    String prefix = 'image',
+    String ext = 'jpg',
+  }) async {
+    try {
+      if (_imagesDir == null || bytes.isEmpty) return null;
+      final ref = imageRefName(
+        prefix,
+        ext,
+        DateTime.now().millisecondsSinceEpoch,
+      );
+      await File('${_imagesDir!.path}${Platform.pathSeparator}'
+              '${ref.split('/').last}')
+          .writeAsBytes(bytes);
+      return ref;
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Resolve an image reference to something displayable.
   /// Returns a local file path, or the URL untouched for network images.
   String? resolveImage(String ref) {
@@ -267,7 +303,67 @@ class StorageService {
     } catch (_) {
       // Silent: never interrupt for IO errors.
     }
+
   }
+  // ---- App settings (small persisted flags) ----
+  static const _kGrammarCheckEnabled = 'grammarCheckEnabled';
+
+  final Map<String, dynamic> _memorySettings = <String, dynamic>{};
+
+  File? get _settingsFile => _base == null
+      ? null
+      : File('${_base!.path}${Platform.pathSeparator}settings.json');
+
+  Future<Map<String, dynamic>> loadSettings() async {
+    final file = _settingsFile;
+    if (file == null) return Map<String, dynamic>.of(_memorySettings);
+    try {
+      if (!await file.exists()) return <String, dynamic>{};
+      final raw = jsonDecode(await file.readAsString());
+      return raw is Map
+          ? Map<String, dynamic>.from(raw)
+          : <String, dynamic>{};
+    } catch (_) {
+      return <String, dynamic>{};
+    }
+  }
+
+  Future<void> saveSettings(Map<String, dynamic> values) async {
+    final file = _settingsFile;
+    if (file == null) {
+      _memorySettings
+        ..clear()
+        ..addAll(values);
+      return;
+    }
+    try {
+      await file.writeAsString(jsonEncode(values));
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
+  }
+
+  /// Whether the AI grammar check is offered in the editor. Defaults to
+  /// on, so an existing install keeps the button it had. Observable
+  /// because the Grammar page and the editor live in the same IndexedStack
+  /// — neither is rebuilt when the other changes.
+  final grammarCheckEnabled = ValueNotifier<bool>(true);
+
+  Future<bool> loadGrammarCheckEnabled() async {
+    final value = (await loadSettings())[_kGrammarCheckEnabled];
+    final enabled = value is bool ? value : true;
+    grammarCheckEnabled.value = enabled;
+    return enabled;
+  }
+
+  /// Read-modify-write so this never clobbers other settings keys.
+  Future<void> saveGrammarCheckEnabled(bool enabled) async {
+    grammarCheckEnabled.value = enabled;
+    final settings = await loadSettings();
+    settings[_kGrammarCheckEnabled] = enabled;
+    await saveSettings(settings);
+  }
+
   List<String> _memoryFolders = [];
   List<String> _memoryLearned = [];
   List<Map<String, dynamic>> _memoryGrammar = [];

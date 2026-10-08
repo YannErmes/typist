@@ -921,6 +921,60 @@ void main() {
     expect(find.text('Conditionals (1)'), findsOneWidget);
   });
 
+  testWidgets('grammar check can be switched off from the Grammar page',
+      (WidgetTester tester) async {
+    final storage = StorageService();
+    await tester.pumpWidget(WordGraphToolApp(storage: storage));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+
+    // On by default, so the editor offers the button.
+    expect(find.text('grammar check'), findsOneWidget);
+
+    await tester.tap(find.text('Grammar'));
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(find.text('Grammar check'), findsWidgets);
+
+    await tester.tap(find.byType(Switch));
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    // Persisted, and the live editor picks it up without a restart.
+    expect(storage.grammarCheckEnabled.value, isFalse);
+    expect(await storage.loadGrammarCheckEnabled(), isFalse);
+
+    await tester.tap(find.text('Sheet'));
+    await tester.pump(const Duration(milliseconds: 800));
+    expect(find.text('grammar check'), findsNothing);
+    expect(find.text('mention'), findsOneWidget);
+  });
+
+  test('frame references are portable and reject unsafe names', () async {
+    // Notes store a relative reference so they survive a moved app folder.
+    expect(StorageService.imageRefName('frame', 'jpg', 1234),
+        'images/frame-1234.jpg');
+
+    // A crafted prefix or extension must not escape the images folder.
+    expect(StorageService.imageRefName('../../evil', 'jpg', 1),
+        'images/image-1.jpg');
+    expect(StorageService.imageRefName('frame', '../../png', 1),
+        'images/frame-1.jpg');
+    expect(StorageService.imageRefName('Frame Note', 'JPEG', 1),
+        'images/image-1.jpg');
+
+    // Network images are handed to Quill untouched; without a real folder
+    // there is nothing local to resolve to.
+    final s = StorageService();
+    await s.init();
+    expect(s.resolveImage('https://x.test/a.png'), 'https://x.test/a.png');
+    expect(s.resolveImage(''), isNull);
+    if (s.isMemoryOnly) {
+      expect(s.resolveImage('images/frame-1.jpg'), isNull);
+      expect(await s.saveImageBytes([1, 2, 3]), isNull);
+    }
+  });
+
   test('repetition rhythms read naturally', () {
     expect(intervalText(1), 'every minute');
     expect(intervalText(5), 'every 5 minutes');

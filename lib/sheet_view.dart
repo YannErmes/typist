@@ -38,6 +38,7 @@ import 'computer_video_base.dart';
 import 'frame_link.dart';
 import 'grammar_check.dart';
 import 'graph_model.dart';
+import 'image_embed.dart';
 import 'storage.dart';
 import 'tag_sheet.dart';
 import 'theme.dart';
@@ -208,7 +209,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   bool _editingKey = false;
 
   // Stream writing: one computer video file per note, floating player.
-  final ComputerVideoBase _video = ComputerVideo();
+  // late so widget.storage is available when the player is first opened.
+  late final ComputerVideoBase _video =
+      ComputerVideo(storage: widget.storage);
   bool _streamOpen = false; // panel expanded
   bool _frameBusy = false; // frame note being captured
   bool _videoOpen = false; // player holds a playable file
@@ -221,6 +224,15 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   Offset _popupOffset = const Offset(0, 40);
   double _editorWidth = 600;
 
+  /// Resolves stored image references for the editor. Built once and
+  /// reused: a fresh EmbedBuilder on every rebuild would throw away
+  /// Quill's in-progress image resize handles.
+  late final QuillEditorImageEmbedConfig _imageEmbedConfig =
+      QuillEditorImageEmbedConfig(
+    imageProviderBuilder: (context, url) =>
+        resolveEmbedImage(widget.storage, url),
+  );
+
   @override
   void initState() {
     super.initState();
@@ -230,9 +242,20 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     _scrollCtrl = ScrollController();
     _quill.addListener(_onDocChanged);
     _titleCtrl.addListener(_onTitleChanged);
+    // The Grammar page and this editor are both alive in an IndexedStack,
+    // so flipping the preference there cannot rebuild us. Listen instead.
+    _grammarCheckOn = widget.storage.grammarCheckEnabled.value;
+    widget.storage.grammarCheckEnabled
+        .addListener(_onGrammarCheckPreference);
     listenClipboardImages(_onClipboardImage);
     _boot();
     _initSpell();
+  }
+
+  void _onGrammarCheckPreference() {
+    final next = widget.storage.grammarCheckEnabled.value;
+    if (!mounted || next == _grammarCheckOn) return;
+    setState(() => _grammarCheckOn = next);
   }
 
   /// A pasted screenshot/snippet lands in the note at the caret (the true
@@ -336,6 +359,8 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
 
   Future<void> _boot() async {
     var sessions = await widget.storage.loadSessions();
+    final grammarCheckOn =
+        await widget.storage.loadGrammarCheckEnabled();
     final storedFolders = await widget.storage.loadFolders();
     _knownFolders.addAll(storedFolders);
     _learned.addAll(await widget.storage.loadLearned());
@@ -356,6 +381,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
     if (!mounted) return;
     setState(() {
       _sessions = sessions;
+      _grammarCheckOn = grammarCheckOn;
       _loaded = true;
     });
     // NOTE: _activeId stays null until _openSession loads the doc.
@@ -1363,6 +1389,8 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   @override
   void dispose() {
     _saveNow();
+    widget.storage.grammarCheckEnabled
+        .removeListener(_onGrammarCheckPreference);
     _saver.dispose();
     _highlighter.dispose();
     _wordCount.dispose();
@@ -1481,6 +1509,9 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   /// Grammar check state.
   bool _grammarBusy = false;
 
+  /// User preference: when off the "grammar check" chip is not offered.
+  bool _grammarCheckOn = true;
+
   /// Resolved grammar flags from the last check (quote + sentence).
   List<({String quote, String sentence, String category, int start})>
       _grammarFlags = [];
@@ -1490,6 +1521,11 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
   /// Never rewrites or suggests rephrasings.
   Future<void> _runGrammarCheck() async {
     if (_grammarBusy || !_loaded) return;
+    if (!_grammarCheckOn) {
+      _notice('Grammar check is off — turn it back on from the '
+          'Grammar page.');
+      return;
+    }
     List<GrammarItem> checked = [];
     try {
       final all = await widget.storage.loadGrammar();
@@ -3049,11 +3085,12 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                 children: [
                                   _sigilButton('@', 'mention',
                                       _onAtButton),
-                                  const SizedBox(width: 8),
-                                  InkWell(
-                                    onTap: _grammarBusy
-                                        ? null
-                                        : _runGrammarCheck,
+                                  if (_grammarCheckOn) ...[
+                                    const SizedBox(width: 8),
+                                    InkWell(
+                                      onTap: _grammarBusy
+                                          ? null
+                                          : _runGrammarCheck,
                                     borderRadius:
                                         BorderRadius.circular(14),
                                     child: Container(
@@ -3099,6 +3136,7 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                       ),
                                     ),
                                   ),
+                                ],
                                   const SizedBox(width: 8),
                                   const Expanded(
                                     child: Text(
@@ -3199,9 +3237,15 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
                                         onLaunchUrl: _onEditorLink,
                                         embedBuilders: kIsWeb
                                             ? FlutterQuillEmbeds
-                                                .editorWebBuilders()
+                                                .editorWebBuilders(
+                                              imageEmbedConfig:
+                                                  _imageEmbedConfig,
+                                            )
                                             : FlutterQuillEmbeds
-                                                .editorBuilders(),
+                                                .editorBuilders(
+                                              imageEmbedConfig:
+                                                  _imageEmbedConfig,
+                                            ),
                                         // Keep single-line: quill embeds the
                                         // placeholder raw in JSON (newlines crash it).
                                         placeholder:

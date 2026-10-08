@@ -13,8 +13,7 @@ class PickedVideo {
 /// frame capture and second-accurate seeking.
 ///
 /// Web plays through our own element, so capture is the true pixels.
-/// Desktop plays through mpv, which exposes no frame grab — there a
-/// frame note is the timestamp label plus the user's own snip.
+/// Desktop asks mpv for the frame and stores it in the images folder.
 abstract class ComputerVideoBase {
   /// Ask the OS for a video file. Null when the user cancels.
   Future<PickedVideo?> pick();
@@ -44,7 +43,9 @@ abstract class ComputerVideoBase {
 
   Future<void> seekTo(int seconds);
 
-  /// Exact current frame as a note-friendly JPEG data URL, or null when
-  /// this platform cannot grab (desktop).
+  /// Exact current frame as something an image embed can display, or null
+  /// when this platform cannot grab one. The value is a reference the
+  /// caller resolves through its storage ([StorageService.resolveImage]),
+  /// not a path that should be trusted as absolute.
   Future<String?> captureFrame();
 }

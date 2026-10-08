@@ -9,6 +9,7 @@ import 'package:web/web.dart' as web;
 
 import 'computer_video_base.dart';
 import 'frame_link.dart';
+import 'storage.dart';
 
 /// Web backend: our own `<video>` element (native controls), so the exact
 /// pixels are always one canvas draw away. Files live as blob URLs;
@@ -17,6 +18,10 @@ import 'frame_link.dart';
 class ComputerVideo extends ComputerVideoBase {
   static const _viewType = 'computer-video-player';
   static bool _registered = false;
+
+  /// Accepts the same argument the desktop backend does; the browser
+  /// keeps frames as data URLs, so it needs no storage.
+  ComputerVideo({StorageService? storage});
 
   /// No native library to load in the browser.
   static void ensureInitialized() {}

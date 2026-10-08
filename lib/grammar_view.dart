@@ -26,6 +26,10 @@ class _GrammarPageState extends State<GrammarPage> {
   List<GrammarItem> _items = [];
   bool _loaded = false;
 
+  /// Whether the editor offers the AI grammar check. Persisted; the
+  /// editor chip disappears while this is off.
+  bool _checkEnabled = true;
+
   @override
   void initState() {
     super.initState();
@@ -42,11 +46,18 @@ class _GrammarPageState extends State<GrammarPage> {
 
   Future<void> _boot() async {
     final items = await widget.storage.loadGrammar();
+    final enabled = await widget.storage.loadGrammarCheckEnabled();
     if (!mounted) return;
     setState(() {
       _items = items;
+      _checkEnabled = enabled;
       _loaded = true;
     });
+  }
+
+  Future<void> _toggleCheck(bool v) async {
+    setState(() => _checkEnabled = v);
+    await widget.storage.saveGrammarCheckEnabled(v);
   }
 
   Future<void> _save() =>
@@ -223,6 +234,44 @@ class _GrammarPageState extends State<GrammarPage> {
                 'Paste sentences with the structures you practise, group them by category, and check the ones the checker should hunt for.',
                 style: TextStyle(
                     color: PaperTheme.inkSoft, fontSize: 12),
+              ),
+              const SizedBox(height: 14),
+              Container(
+                padding: const EdgeInsets.fromLTRB(12, 4, 8, 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEFE8D6),
+                  border: Border.all(color: PaperTheme.lineThin),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('Grammar check',
+                              style: TextStyle(
+                                  color: PaperTheme.ink,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600)),
+                          const SizedBox(height: 2),
+                          Text(
+                            _checkEnabled
+                                ? 'The "grammar check" button shows in the editor.'
+                                : 'Hidden from the editor. Your sentences are kept.',
+                            style: const TextStyle(
+                                color: PaperTheme.inkSoft, fontSize: 11.5),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Switch(
+                      value: _checkEnabled,
+activeThumbColor: PaperTheme.inkSoft,
+                      onChanged: _loaded ? _toggleCheck : null,
+                    ),
+                  ],
+                ),
               ),
               const SizedBox(height: 14),
               Row(

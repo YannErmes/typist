@@ -1,18 +1,26 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/widgets.dart';
+import 'package:image/image.dart' as img;
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 
 import 'computer_video_base.dart';
 import 'frame_link.dart';
+import 'storage.dart';
 
-/// Desktop backend: mpv playback of real files. mpv exposes no frame grab
-/// here, so [captureFrame] stays null and a frame note is the timestamp
-/// label (seekable) plus the user's own snip.
+/// Desktop backend: mpv playback of real files. A frame note grabs the
+  /// current frame through mpv's screenshot command, shrunk and stored in
+  /// the app's images folder.
 class ComputerVideo extends ComputerVideoBase {
+  /// Where grabbed frames are written. Null means capture is unavailable.
+  final StorageService? storage;
+
+  ComputerVideo({this.storage});
+
   static bool _initialized = false;
 
   /// Must run before any [Player] exists, so mpv loads with the texture
@@ -233,6 +241,44 @@ class ComputerVideo extends ComputerVideoBase {
     } catch (_) {}
   }
 
+  /// The exact current frame, as an `images/<name>` reference to embed in
+  /// the note. mpv hands back full-resolution JPEG, so it is shrunk first:
+  /// a frame lives inside the note's saved JSON, and a raw 1080p grab is
+  /// roughly a quarter-megabyte of base64 per frame note.
   @override
-  Future<String?> captureFrame() async => null;
+  Future<String?> captureFrame() async {
+    final player = _player;
+    final store = storage;
+    if (player == null || store == null) return null;
+    try {
+      final raw = await player.screenshot(format: 'image/jpeg');
+      if (raw == null || raw.isEmpty) return null;
+      return await store.saveImageBytes(
+        _shrink(raw),
+        prefix: 'frame',
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Cap the long edge and re-encode. Falls back to the original bytes
+  /// if decoding fails, so a grab is never lost to a resize problem.
+  static Uint8List _shrink(
+    Uint8List jpeg, {
+    int maxSide = 720,
+    int quality = 82,
+  }) {
+    try {
+      final decoded = img.decodeJpg(jpeg);
+      if (decoded == null) return jpeg;
+      if (decoded.width <= maxSide && decoded.height <= maxSide) return jpeg;
+      final resized = (decoded.width >= decoded.height)
+          ? img.copyResize(decoded, width: maxSide)
+          : img.copyResize(decoded, height: maxSide);
+      return Uint8List.fromList(img.encodeJpg(resized, quality: quality));
+    } catch (_) {
+      return jpeg;
+    }
+  }
 }
