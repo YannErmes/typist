@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 
+import 'computer_video.dart';
 import 'forbidden_view.dart';
 import 'grammar_view.dart';
 import 'graph_model.dart';
@@ -27,6 +28,16 @@ class CrashCenter {
 }
 
 void main() {
+  // mpv must be loaded before the first Player/VideoController exists,
+  // otherwise the native video output is created against an uninitialised
+  // library and renders nothing. A failure here costs us the video
+  // feature only, so it must not take the whole app down with it.
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    ComputerVideo.ensureInitialized();
+  } catch (e) {
+    debugPrint('media_kit failed to initialise: $e');
+  }
   runZonedGuarded(
     () {
       FlutterError.onError = (details) {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -14,16 +15,32 @@ import 'frame_link.dart';
 class ComputerVideo extends ComputerVideoBase {
   static bool _initialized = false;
 
-  Player? _player;
-  VideoController? _ctrl;
-
-  void _ensure() {
+  /// Must run before any [Player] exists, so mpv loads with the texture
+  /// pipeline already in place. Called from `main()`, not lazily.
+  static void ensureInitialized() {
     if (_initialized) return;
-    try {
-      MediaKit.ensureInitialized();
-    } catch (_) {}
+    MediaKit.ensureInitialized();
     _initialized = true;
   }
+
+  Player? _player;
+  VideoController? _ctrl;
+  String _ref = '';
+  String _error = '';
+
+  /// Guards against a stale open resuming after a newer one started.
+  int _gen = 0;
+
+  /// Tears down overlap. mpv's ANGLE/D3D11 render context is shared per
+  /// process, so a new player must never be built while the old one is
+  /// still tearing down — that race is what produced black rectangles.
+  Future<void> _teardown = Future<void>.value();
+
+  /// Errors are loud in the log and short in the UI.
+  StreamSubscription<String>? _errorSub;
+
+  @override
+  String get lastError => _error;
 
   @override
   Future<PickedVideo?> pick() async {
@@ -50,32 +67,130 @@ class ComputerVideo extends ComputerVideoBase {
   @override
   Future<bool> openRef(String ref) async {
     close();
+    _error = '';
+    final gen = _gen;
+    // Wait for the previous player to be fully gone before building the
+    // next one, otherwise two render contexts fight over the same GPU
+    // resources and the frame comes out black.
+    await _teardown;
+    if (gen != _gen) return false;
     try {
       if (ref.trim().isEmpty) return false;
-      if (!await File(ref).exists()) return false;
-      _ensure();
+      final file = File(ref);
+      if (!await file.exists()) {
+        _error = 'File not found at $ref';
+        return false;
+      }
+      ensureInitialized();
       final player = Player();
-      await player.open(Media(ref));
-      _ctrl = VideoController(player);
+      final ctrl = VideoController(
+        player,
+        configuration: const VideoControllerConfiguration(
+          // ANGLE/D3D11 texture sharing is the usual source of black
+          // frames on Windows; software rendering is slower but solid.
+          enableHardwareAcceleration: false,
+          hwdec: 'no',
+        ),
+      );
+      if (gen != _gen) {
+        await player.dispose();
+        return false;
+      }
       _player = player;
+      _ctrl = ctrl;
+      _ref = ref;
+      _errorSub = player.stream.error.listen((e) => _error = e);
+
+      // The controller must exist before the file is loaded: it is what
+      // installs `vo=libmpv` and creates the texture, and mpv picks its
+      // video output the moment a track initialises. Opening first leaves
+      // the track bound to the default `vo=null`, which is a black screen
+      // with working audio.
+      //
+      // VideoController defers its native setup to a post-frame callback.
+      // Nothing else here schedules a frame — this open is fire-and-forget
+      // from a Future, not a build — so without this nudge the controller
+      // would never finish creating and open() would hang forever.
+      try {
+        WidgetsBinding.instance.scheduleFrame();
+      } catch (_) {
+        // No binding (unit test); the controller still initialises.
+      }
+      try {
+        await ctrl.platform.future.timeout(
+          const Duration(seconds: 15),
+        );
+      } catch (_) {
+        _error = 'Could not start the video renderer';
+        close();
+        return false;
+      }
+      if (gen != _gen) return false;
+
+      await player.open(Media(file.uri.toString()));
+      if (gen != _gen) return false;
+
+      await player.play();
+      // Only report success once mpv knows the track size. Without this
+      // the caller shows the player card before anything is decodable.
+      await _waitForTrack(player);
+      if (gen != _gen) return false;
+      if (!_hasSize(player)) {
+        _error = 'No video track in ${FrameLink.basename(ref)}';
+        close();
+        return false;
+      }
       return true;
-    } catch (_) {
+    } catch (e) {
+      _error = '$e';
       close();
       return false;
     }
   }
 
-  @override
-  void close() {
-    _ctrl = null;
-    final player = _player;
-    _player = null;
-    if (player != null) {
-      // Disposing the player releases its video controller too.
-      try {
-        player.dispose();
-      } catch (_) {}
+  /// Wait until mpv reports a video size, or give up after [timeout].
+  /// The size often arrives *before* this is called, so check the current
+  /// state first — waiting on the stream blindly would stall every open
+  /// for the full timeout.
+  Future<void> _waitForTrack(
+    Player player, {
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    if (_hasSize(player)) return;
+    try {
+      await player.stream.videoParams
+          .firstWhere((p) => (p.dw ?? 0) > 0 && (p.dh ?? 0) > 0)
+          .timeout(timeout);
+    } catch (_) {
+      // Timed out; the caller's size check decides.
     }
+  }
+
+  bool _hasSize(Player player) =>
+      (player.state.width ?? 0) > 0 && (player.state.height ?? 0) > 0;
+
+@override
+  void close() {
+    _gen++;
+    final player = _player;
+    final sub = _errorSub;
+    _player = null;
+    _ctrl = null;
+    _ref = '';
+    _errorSub = null;
+    // NB: _error is deliberately not cleared here. Failure paths set it
+    // and *then* call close(), and the caller reads lastError after.
+    if (sub != null) {
+      unawaited(sub.cancel().catchError((Object _) {}));
+    }
+    if (player == null) return;
+    _teardown = _teardown.then((_) async {
+      try {
+        await player.dispose();
+      } catch (_) {
+        // Already disposed, or the handle is gone; nothing to salvage.
+      }
+    });
   }
 
   @override
@@ -85,7 +200,15 @@ class ComputerVideo extends ComputerVideoBase {
   Widget buildPlayer() {
     final ctrl = _ctrl;
     if (ctrl == null) return const SizedBox.shrink();
-    return Video(controller: ctrl);
+    // Key on the ref so switching notes rebuilds VideoState instead of
+    // reusing one whose `_visible` was latched from the previous player.
+    return Video(
+      key: ValueKey<String>(_ref),
+      controller: ctrl,
+      fit: BoxFit.contain,
+      // Black fill until the first frame lands; nothing else to show.
+      fill: const Color(0xFF000000),
+    );
   }
 
   @override

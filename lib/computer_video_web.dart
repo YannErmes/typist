@@ -18,10 +18,14 @@ class ComputerVideo extends ComputerVideoBase {
   static const _viewType = 'computer-video-player';
   static bool _registered = false;
 
+  /// No native library to load in the browser.
+  static void ensureInitialized() {}
+
   final Map<String, Uint8List> _bytes = {};
   web.HTMLVideoElement? _el;
   String? _url;
   String? _ref;
+  String _error = '';
 
   String? get _openRef => _ref;
 
@@ -56,7 +60,10 @@ class ComputerVideo extends ComputerVideoBase {
     close();
     try {
       final bytes = _bytes[ref];
-      if (bytes == null || bytes.isEmpty) return false;
+      if (bytes == null || bytes.isEmpty) {
+        _error = 'Reload the page to pick this file again.';
+        return false;
+      }
       final blob = web.Blob([bytes.toJS].toJS);
       _url = web.URL.createObjectURL(blob);
       final el = web.HTMLVideoElement()
@@ -68,7 +75,8 @@ class ComputerVideo extends ComputerVideoBase {
       _el = el;
       _ref = ref;
       return true;
-    } catch (_) {
+    } catch (e) {
+      _error = '$e';
       close();
       return false;
     }
@@ -80,12 +88,17 @@ class ComputerVideo extends ComputerVideoBase {
     _url = null;
     _el = null;
     _ref = null;
+    // NB: _error is deliberately not cleared here. Failure paths set it
+    // and *then* call close(), and the caller reads lastError after.
     if (url != null) {
       try {
         web.URL.revokeObjectURL(url);
       } catch (_) {}
     }
   }
+
+  @override
+  String get lastError => _error;
 
   @override
   String displayName(String ref) => FrameLink.basename(ref);

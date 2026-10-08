@@ -1205,6 +1205,10 @@ class SheetViewState extends State<SheetView> with WidgetsBindingObserver {
         if (!ok) _video.close();
         return;
       }
+      if (!ok) {
+        final why = _video.lastError;
+        if (why.isNotEmpty) _notice('Video would not open: $why');
+      }
       setState(() {
         _videoOpen = ok;
         _videoMissing = !ok;

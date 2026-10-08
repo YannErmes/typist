@@ -32,6 +32,10 @@ abstract class ComputerVideoBase {
   /// Display name for a stored reference.
   String displayName(String ref);
 
+  /// Why the last [openRef] failed, for the user-facing message.
+  /// Empty when the failure has nothing useful to say.
+  String get lastError => '';
+
   /// Inline player widget (only valid while a video is open).
   Widget buildPlayer();
 
