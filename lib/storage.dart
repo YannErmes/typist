@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'flashcard_model.dart';
 import 'frame_link.dart';
 import 'graph_model.dart';
 
@@ -125,6 +126,7 @@ class StorageService {
   Directory? _imagesDir;
   File? _legacySheetFile;
   File? _forbiddenFile;
+  File? _flashFile;
 
   Directory? get baseDir => _base;
   String get basePath => _base?.path ?? '';
@@ -134,6 +136,8 @@ class StorageService {
   final Map<String, Map<String, dynamic>> _memorySessions = {};
   String _memoryLegacy = '';
   List<String> _memoryForbidden = [];
+  List<Map<String, dynamic>> _memoryFlashBundles = [];
+  List<Map<String, dynamic>> _memoryFlashSentences = [];
 
   /// True when running without a real folder (browser preview).
   bool get isMemoryOnly => _base == null;
@@ -159,6 +163,8 @@ class StorageService {
           '${_base!.path}${Platform.pathSeparator}sheet.txt');
       _forbiddenFile = File(
           '${_base!.path}${Platform.pathSeparator}forbidden.txt');
+      _flashFile = File(
+          '${_base!.path}${Platform.pathSeparator}flashcards.json');
     } catch (_) {
       // No documents folder (e.g. web preview): keep everything in memory.
       _base = null;
@@ -167,6 +173,7 @@ class StorageService {
       _imagesDir = null;
       _legacySheetFile = null;
       _forbiddenFile = null;
+      _flashFile = null;
     }
   }
 
@@ -519,6 +526,84 @@ class StorageService {
     } catch (_) {
       // Silent: never interrupt for IO errors.
     }
+  }
+
+  // ---- Flash cards ----
+  Future<Map<String, dynamic>> _readFlashRaw() async {
+    if (_flashFile == null) {
+      return {
+        'bundles': List<Map<String, dynamic>>.of(_memoryFlashBundles),
+        'sentences': List<Map<String, dynamic>>.of(_memoryFlashSentences),
+      };
+    }
+    try {
+      if (!await _flashFile!.exists()) return <String, dynamic>{};
+      final decoded = jsonDecode(await _flashFile!.readAsString());
+      return decoded is Map
+          ? Map<String, dynamic>.from(decoded)
+          : <String, dynamic>{};
+    } catch (_) {
+      return <String, dynamic>{};
+    }
+  }
+
+  Future<void> _writeFlashRaw(Map<String, dynamic> raw) async {
+    if (_flashFile == null) {
+      _memoryFlashBundles = [
+        for (final e in (raw['bundles'] is List ? raw['bundles'] as List : const []))
+          if (e is Map) Map<String, dynamic>.from(e),
+      ];
+      _memoryFlashSentences = [
+        for (final e in (raw['sentences'] is List ? raw['sentences'] as List : const []))
+          if (e is Map) Map<String, dynamic>.from(e),
+      ];
+      return;
+    }
+    try {
+      await _flashFile!.writeAsString(jsonEncode(raw));
+    } catch (_) {
+      // Silent: never interrupt writing for IO errors.
+    }
+  }
+
+  static List<dynamic> _flashList(dynamic raw) =>
+      raw is List ? raw : const <dynamic>[];
+
+  /// Named flash-card exercises, newest first.
+  Future<List<FlashBundle>> loadFlashBundles() async {
+    final raw = await _readFlashRaw();
+    final out = <FlashBundle>[];
+    for (final e in _flashList(raw['bundles'])) {
+      final b = FlashBundle.fromJson(e);
+      if (b != null) out.add(b);
+    }
+    out.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return out;
+  }
+
+  /// Every sentence ever written on a card, across all bundles.
+  Future<List<FlashSentence>> loadFlashSentences() async {
+    final raw = await _readFlashRaw();
+    final out = <FlashSentence>[];
+    for (final e in _flashList(raw['sentences'])) {
+      final s = FlashSentence.fromJson(e);
+      if (s != null) out.add(s);
+    }
+    return out;
+  }
+
+  /// Read-modify-write so saving bundles never wipes sentences (or the
+  /// other way round) — both live in the one flashcards.json file.
+  Future<void> saveFlashBundles(List<FlashBundle> bundles) async {
+    final raw = await _readFlashRaw();
+    raw['bundles'] = [for (final b in bundles) b.toJson()];
+    await _writeFlashRaw(raw);
+  }
+
+  Future<void> saveFlashSentences(List<FlashSentence> sentences) async {
+    final raw = await _readFlashRaw();
+    raw['sentences'] = [for (final s in sentences) s.toJson()];
+    await _writeFlashRaw(raw);
   }
 
   // ---- Writing sessions ----

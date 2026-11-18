@@ -6,6 +6,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 
 import 'computer_video.dart';
+import 'flashcard_view.dart';
 import 'forbidden_view.dart';
 import 'grammar_view.dart';
 import 'graph_model.dart';
@@ -78,8 +79,8 @@ class WordGraphToolApp extends StatelessWidget {
   }
 }
 
-/// Four views: Sheet (writing), Graph (word network), Banned (forbidden),
-/// Grammar (structures), Practice (spaced repetition).
+/// Six views: Sheet (writing), Graph (word network), Banned (forbidden),
+/// Grammar (structures), Practice (spaced repetition), Cards (flash cards).
 class HomeShell extends StatefulWidget {
   final StorageService? storage;
   const HomeShell({super.key, this.storage});
@@ -92,6 +93,8 @@ class _HomeShellState extends State<HomeShell> {
   late final StorageService _storage;
   final WordGraph _graph = WordGraph();
   final GlobalKey<SheetViewState> _sheetKey = GlobalKey<SheetViewState>();
+  final GlobalKey<FlashCardViewState> _flashKey =
+      GlobalKey<FlashCardViewState>();
 
   /// Forbidden words, shared live with the writing + banned views.
   final List<String> _forbidden = [];
@@ -136,6 +139,14 @@ class _HomeShellState extends State<HomeShell> {
     _sheetKey.currentState?.refreshGraph();
   }
 
+  /// Graph page: start a flash-card bundle around the selected word and
+  /// bring the Cards page forward to name it. The page stays alive in the
+  /// IndexedStack, so its state is ready to receive the request.
+  void _startFlashCards(String word) {
+    setState(() => _tab = 5);
+    _flashKey.currentState?.requestNewBundle(word);
+  }
+
   /// Small floating nav pill (always on top of the current tab).
   Widget _navPill() {
     return Material(
@@ -157,6 +168,7 @@ class _HomeShellState extends State<HomeShell> {
             _pillItem(2, Icons.block, 'Banned'),
             _pillItem(3, Icons.spellcheck, 'Grammar'),
             _pillItem(4, Icons.repeat_outlined, 'Practice'),
+            _pillItem(5, Icons.style, 'Cards'),
           ],
         ),
       ),
@@ -247,10 +259,17 @@ class _HomeShellState extends State<HomeShell> {
                   storage: _storage,
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
+                  onFlashCards: _startFlashCards,
                 ),
                 ForbiddenPage(storage: _storage, words: _forbidden),
                 GrammarPage(storage: _storage),
                 RepetitionView(
+                  storage: _storage,
+                  graph: _graph,
+                  onGraphChanged: _onGraphChanged,
+                ),
+                FlashCardView(
+                  key: _flashKey,
                   storage: _storage,
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,

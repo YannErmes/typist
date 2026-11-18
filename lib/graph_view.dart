@@ -29,6 +29,10 @@ class GraphView extends StatefulWidget {
   /// Fires whenever the selected word changes (null when deleted).
   final ValueChanged<String?>? onSelectionChanged;
 
+  /// Fires from the inspector's flash-card button. Null hides the button
+  /// (e.g. the small map peek inside a repetition practice).
+  final ValueChanged<String>? onFlashCards;
+
   const GraphView({
     super.key,
     required this.storage,
@@ -36,6 +40,7 @@ class GraphView extends StatefulWidget {
     required this.onGraphChanged,
     this.initialWord,
     this.onSelectionChanged,
+    this.onFlashCards,
   });
 
   @override
@@ -1764,6 +1769,15 @@ class GraphViewState extends State<GraphView> {
                               size: 17,
                               color: PaperTheme.inkSoft),
                         ),
+                        if (widget.onFlashCards != null)
+                          IconButton(
+                            tooltip: 'Make flash cards',
+                            onPressed: () =>
+                                widget.onFlashCards!(sel.name),
+                            icon: const Icon(Icons.style_outlined,
+                                size: 17,
+                                color: PaperTheme.inkSoft),
+                          ),
                         if (sel.hasImage)
                           TextButton.icon(
                             onPressed: _removePicture,

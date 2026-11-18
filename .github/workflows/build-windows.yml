@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Needed for softprops/action-gh-release to attach the zip on version tags.
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
