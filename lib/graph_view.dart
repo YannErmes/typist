@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart' show kIsWeb, visibleForTesting;
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
+import 'graph_images.dart';
 import 'graph_model.dart';
 import 'repetition_logic.dart';
 import 'storage.dart';
@@ -33,6 +34,14 @@ class GraphView extends StatefulWidget {
   /// (e.g. the small map peek inside a repetition practice).
   final ValueChanged<String>? onFlashCards;
 
+  /// When set, the board is being used as a picture picker: the normal
+  /// inspector is replaced by this hint and every selection is reported
+  /// through [onSelectionChanged].
+  final String? pickerHint;
+
+  /// Shows a Done button in the picker bar to leave pick mode.
+  final VoidCallback? onDonePicking;
+
   const GraphView({
     super.key,
     required this.storage,
@@ -41,6 +50,8 @@ class GraphView extends StatefulWidget {
     this.initialWord,
     this.onSelectionChanged,
     this.onFlashCards,
+    this.pickerHint,
+    this.onDonePicking,
   });
 
   @override
@@ -934,10 +945,10 @@ class GraphViewState extends State<GraphView> {
         if (picked == null) return;
         if (kIsWeb) {
           final bytes = await picked.readAsBytes();
-          final key =
-              'mem:${DateTime.now().millisecondsSinceEpoch}';
-          setState(() => _memImages[key] = bytes);
-          ref = key;
+          // Store the picture ON the word as a data URL. A `mem:` ref
+          // only lived in this one widget, so other GraphViews (and a
+          // later page load) could not see the image at all.
+          ref = graphDataUrl(bytes);
         } else {
           ref = await widget.storage.importImageFile(picked.path);
           if (ref == null || !mounted) {
@@ -1254,13 +1265,33 @@ class GraphViewState extends State<GraphView> {
     return Color(c);
   }
 
-  /// In-memory bytes for web-picked pictures (`mem:` refs).
+  /// Bytes picked in this page before the shared registry existed. Kept so
+  /// a hot reload does not throw away pictures the user already added.
   final Map<String, Uint8List> _memImages = {};
+
+  /// Bytes behind a `mem:` picture ref. Shared app-wide so the Blast map
+  /// picker sees the same pictures as the main Graph page.
+  Uint8List? imageBytesFor(String ref) {
+    final shared = GraphImages.get(ref);
+    if (shared != null) return shared;
+    final local = _memImages[ref];
+    if (local != null) GraphImages.put(ref, local); // migrate old state
+    return local;
+  }
 
   /// Picture for a node, or null for plain word bubbles.
   Widget? _nodePicture(String word) {
     final ref = widget.graph.get(word)?.image?.trim();
     if (ref == null || ref.isEmpty) return null;
+    // Browser file picks are stored as data URLs on the word itself.
+    if (ref.startsWith('data:')) {
+      final bytes = graphDataBytes(ref);
+      if (bytes == null) return _brokenPicture();
+      return Image.memory(bytes,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) =>
+              _brokenPicture());
+    }
     if (ref.startsWith('http://') || ref.startsWith('https://')) {
       return Image.network(ref,
           fit: BoxFit.cover,
@@ -1268,7 +1299,7 @@ class GraphViewState extends State<GraphView> {
               _brokenPicture());
     }
     if (ref.startsWith('mem:')) {
-      final bytes = _memImages[ref];
+      final bytes = imageBytesFor(ref);
       if (bytes == null) return _brokenPicture();
       return Image.memory(bytes,
           fit: BoxFit.cover,
@@ -1676,8 +1707,46 @@ class GraphViewState extends State<GraphView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
+                // Picker hint replaces the normal inspector so a "pick
+                // picture words" dialog cannot edit the map by accident.
+                if (widget.pickerHint != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 9),
+                    decoration: const BoxDecoration(
+                      color: PaperTheme.paperDark,
+                      border: Border(
+                          bottom:
+                              BorderSide(color: PaperTheme.lineThin)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.photo_library_outlined,
+                            size: 15, color: PaperTheme.inkSoft),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(widget.pickerHint!,
+                              style: const TextStyle(
+                                  color: PaperTheme.ink,
+                                  fontSize: 11.5)),
+                        ),
+                        if (widget.onDonePicking != null)
+                          FilledButton(
+                            style: FilledButton.styleFrom(
+                              backgroundColor: PaperTheme.ink,
+                              foregroundColor: PaperTheme.paper,
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 12, vertical: 4),
+                            ),
+                            onPressed: widget.onDonePicking,
+                            child: const Text('Done',
+                                style: TextStyle(fontSize: 11)),
+                          ),
+                      ],
+                    ),
+                  )
                 // Inspector for the selected word.
-                if (sel != null)
+                else if (sel != null)
                   Container(
                     padding: const EdgeInsets.symmetric(
                         horizontal: 14, vertical: 8),

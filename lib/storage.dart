@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'blast_model.dart';
 import 'flashcard_model.dart';
 import 'frame_link.dart';
 import 'graph_model.dart';
@@ -127,6 +128,7 @@ class StorageService {
   File? _legacySheetFile;
   File? _forbiddenFile;
   File? _flashFile;
+  File? _blastFile;
 
   Directory? get baseDir => _base;
   String get basePath => _base?.path ?? '';
@@ -138,6 +140,7 @@ class StorageService {
   List<String> _memoryForbidden = [];
   List<Map<String, dynamic>> _memoryFlashBundles = [];
   List<Map<String, dynamic>> _memoryFlashSentences = [];
+  List<Map<String, dynamic>> _memoryBlastBundles = [];
 
   /// True when running without a real folder (browser preview).
   bool get isMemoryOnly => _base == null;
@@ -165,6 +168,8 @@ class StorageService {
           '${_base!.path}${Platform.pathSeparator}forbidden.txt');
       _flashFile = File(
           '${_base!.path}${Platform.pathSeparator}flashcards.json');
+      _blastFile = File(
+          '${_base!.path}${Platform.pathSeparator}blast.json');
     } catch (_) {
       // No documents folder (e.g. web preview): keep everything in memory.
       _base = null;
@@ -174,6 +179,7 @@ class StorageService {
       _legacySheetFile = null;
       _forbiddenFile = null;
       _flashFile = null;
+      _blastFile = null;
     }
   }
 
@@ -604,6 +610,42 @@ class StorageService {
     final raw = await _readFlashRaw();
     raw['sentences'] = [for (final s in sentences) s.toJson()];
     await _writeFlashRaw(raw);
+  }
+
+  // ---- Blast typing-game bundles ----
+  Future<List<BlastBundle>> loadBlastBundles() async {
+    Iterable<dynamic> raw;
+    if (_blastFile == null) {
+      raw = _memoryBlastBundles;
+    } else {
+      try {
+        if (!await _blastFile!.exists()) return const [];
+        raw = jsonDecode(await _blastFile!.readAsString()) as List;
+      } catch (_) {
+        return const [];
+      }
+    }
+    final out = <BlastBundle>[];
+    for (final e in raw) {
+      final b = BlastBundle.fromJson(e);
+      if (b != null) out.add(b);
+    }
+    out.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return out;
+  }
+
+  Future<void> saveBlastBundles(List<BlastBundle> bundles) async {
+    final raw = [for (final b in bundles) b.toJson()];
+    if (_blastFile == null) {
+      _memoryBlastBundles =
+          raw.map((e) => Map<String, dynamic>.from(e)).toList();
+      return;
+    }
+    try {
+      await _blastFile!.writeAsString(jsonEncode(raw));
+    } catch (_) {
+      // Silent: never interrupt for IO errors.
+    }
   }
 
   // ---- Writing sessions ----

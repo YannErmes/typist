@@ -1,0 +1,243 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:word_graph_tool/blast_game.dart';
+import 'package:word_graph_tool/blast_model.dart';
+import 'package:word_graph_tool/blast_view.dart';
+import 'package:word_graph_tool/graph_images.dart';
+import 'package:word_graph_tool/graph_model.dart';
+import 'package:word_graph_tool/graph_view.dart';
+import 'package:word_graph_tool/storage.dart';
+
+Future<void> wide(WidgetTester tester) async {
+  tester.view.physicalSize = const Size(1280, 800);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(() {
+    tester.view.resetPhysicalSize();
+    tester.view.resetDevicePixelRatio();
+  });
+  await tester.pump(const Duration(milliseconds: 100));
+}
+
+/// Mirrors the shell wiring: tapping a word in the real Graph page calls
+/// BlastViewState.addPickedWord, exactly as HomeShell does.
+class _PickerHarness extends StatefulWidget {
+  final StorageService storage;
+  final WordGraph graph;
+  const _PickerHarness({required this.storage, required this.graph});
+
+  @override
+  State<_PickerHarness> createState() => _PickerHarnessState();
+}
+
+class _PickerHarnessState extends State<_PickerHarness> {
+  final _blast = GlobalKey<BlastViewState>();
+
+  BlastViewState get blast => _blast.currentState!;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Expanded(
+          child: BlastView(
+            key: _blast,
+            storage: widget.storage,
+            graph: widget.graph,
+            onGraphChanged: () {},
+            onRequestPick: () {},
+          ),
+        ),
+        SizedBox(
+          height: 320,
+          child: GraphView(
+            storage: widget.storage,
+            graph: widget.graph,
+            onGraphChanged: () {},
+            pickerHint: 'Tap picture words',
+            onSelectionChanged: (word) {
+              if (word != null) _blast.currentState?.addPickedWord(word);
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+void main() {
+  test('blast bundles and their picture words round-trip', () {
+    final bundle = BlastBundle(
+      id: 'b1',
+      title: 'Kitchen',
+      items: const [
+        BlastItem(word: 'house', image: 'images/house.jpg'),
+        BlastItem(word: 'kitchen', image: 'https://example.com/kitchen.png'),
+      ],
+    );
+    final back = BlastBundle.fromJson(bundle.toJson())!;
+    expect(back.title, 'Kitchen');
+    expect(back.items.length, 2);
+    expect(back.items.first.word, 'house');
+    expect(back.items.last.image, contains('https://'));
+    expect(BlastItem.fromJson({'word': 'x'}), isNull);
+  });
+
+  test('blast bundles save and reload without init', () async {
+    final s = StorageService();
+    await s.saveBlastBundles([
+      BlastBundle(
+        id: 'b1',
+        title: 'One',
+        items: const [BlastItem(word: 'house', image: 'images/house.jpg')],
+        createdAt: 1000,
+      ),
+    ]);
+    final back = await s.loadBlastBundles();
+    expect(back.single.title, 'One');
+    expect(back.single.items.single.word, 'house');
+  });
+
+  testWidgets('Pick from map adds words that have a picture',
+      (WidgetTester tester) async {
+    await wide(tester);
+    final storage = StorageService();
+    final graph = WordGraph();
+    graph.connect('house', 'door');
+    graph.get('house')!.image = 'images/house.jpg';
+    graph.get('door')!.image = 'images/door.jpg';
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(body: _PickerHarness(storage: storage, graph: graph)),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    final harness = tester.state<_PickerHarnessState>(
+        find.byType(_PickerHarness));
+    final view = harness.blast;
+
+    await view.debugCreateBundle('House words', const []);
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Edit'));
+    await tester.pump();
+    expect(find.text('Pick from map…'), findsOneWidget);
+
+    // Tapping a word on the graph page adds it to the open bundle.
+    final picker = tester.state<GraphViewState>(find.byType(GraphView));
+    await picker.debugCreateWord('house', const Offset(300, 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(view.debugEditing!.items.length, 1);
+    expect(view.debugEditing!.items.single.word, 'house');
+
+    // A plain word with no picture must not join the bundle.
+    await picker.debugCreateWord('plain', const Offset(320, 300));
+    await tester.pump();
+    expect(view.debugEditing!.items.length, 1);
+
+    final saved = await storage.loadBlastBundles();
+    expect(saved.single.items.single.word, 'house');
+  });
+
+  testWidgets('browser-picked mem pictures show and add in the picker',
+      (WidgetTester tester) async {
+    await wide(tester);
+    // The 1x1 PNG a browser pick would have stored as a `mem:` ref.
+    final bytes = Uint8List.fromList(base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=='));
+    GraphImages.put('mem:picture1', bytes);
+
+    final storage = StorageService();
+    final graph = WordGraph();
+    graph.ensure('doc').image = 'mem:picture1';
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(body: _PickerHarness(storage: storage, graph: graph)),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    final view =
+        tester.state<_PickerHarnessState>(find.byType(_PickerHarness)).blast;
+    await view.debugCreateBundle('Web words', const []);
+    await tester.pump(const Duration(milliseconds: 300));
+    await tester.tap(find.text('Edit'));
+    await tester.pump();
+
+    // The picture must render on the graph page that does the picking.
+    expect(
+      find.byWidgetPredicate((w) => w is Image && w.image is MemoryImage),
+      findsOneWidget,
+      reason: 'the mem picture should render on the map',
+    );
+
+    final picker = tester.state<GraphViewState>(find.byType(GraphView));
+    await picker.debugCreateWord('doc', const Offset(300, 300));
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(view.debugEditing!.items.length, 1);
+    expect(view.debugEditing!.items.single.image, startsWith('data:image'));
+  });
+
+  testWidgets('browser file-pick data URLs render on the graph page',
+      (WidgetTester tester) async {
+    await wide(tester);
+    final bytes = Uint8List.fromList(base64Decode(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=='));
+    final storage = StorageService();
+    final graph = WordGraph();
+    graph.ensure('kk').image = 'data:image/png;base64,${base64Encode(bytes)}';
+
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: GraphView(
+            storage: storage, graph: graph, onGraphChanged: () {}),
+      ),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    expect(
+      find.byWidgetPredicate((w) => w is Image && w.image is MemoryImage),
+      findsOneWidget,
+      reason: 'a file-picked picture must show on the map, not a broken icon',
+    );
+  });
+
+  testWidgets('typing a picture word fires and scores',
+      (WidgetTester tester) async {
+    await wide(tester);
+    final storage = StorageService();
+    final graph = WordGraph();
+    await storage.saveBlastBundles([
+      BlastBundle(
+        id: 'b1',
+        title: 'Game',
+        items: const [BlastItem(word: 'house', image: 'images/house.jpg')],
+      ),
+    ]);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: BlastView(
+            storage: storage,
+            graph: graph,
+            onGraphChanged: () {},
+            onRequestPick: () {}),
+      ),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    await tester.tap(find.text('Play'));
+    // Drive real frames: a ticker needs many small steps, one big pump
+    // only advances the game clock by a single (clamped) frame.
+    for (var i = 0; i < 150; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+
+    final game = tester.state<BlastGameState>(find.byType(BlastGame));
+    expect(game.debugRunning, isTrue);
+    expect(find.text('SCORE'), findsOneWidget);
+    expect(game.debugChainLength, greaterThan(0),
+        reason: 'a picture ball must spawn before it can be typed');
+
+    game.debugType('house');
+    for (var i = 0; i < 90; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(game.debugScore, greaterThan(0));
+  });
+}

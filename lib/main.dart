@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_quill/flutter_quill.dart';
 
+import 'blast_view.dart';
 import 'computer_video.dart';
 import 'flashcard_view.dart';
 import 'forbidden_view.dart';
@@ -29,18 +30,21 @@ class CrashCenter {
 }
 
 void main() {
+  // The binding must be initialised INSIDE the guarded zone: doing it in
+  // the root zone and then calling runApp in the new one trips Flutter's
+  // "Zone mismatch" assertion on web and can break hot reload.
   // mpv must be loaded before the first Player/VideoController exists,
   // otherwise the native video output is created against an uninitialised
   // library and renders nothing. A failure here costs us the video
   // feature only, so it must not take the whole app down with it.
-  WidgetsFlutterBinding.ensureInitialized();
-  try {
-    ComputerVideo.ensureInitialized();
-  } catch (e) {
-    debugPrint('media_kit failed to initialise: $e');
-  }
   runZonedGuarded(
     () {
+      WidgetsFlutterBinding.ensureInitialized();
+      try {
+        ComputerVideo.ensureInitialized();
+      } catch (e) {
+        debugPrint('media_kit failed to initialise: $e');
+      }
       FlutterError.onError = (details) {
         final text = '${details.exceptionAsString()}\n${details.stack ?? ''}';
         CrashCenter.record(text);
@@ -79,8 +83,9 @@ class WordGraphToolApp extends StatelessWidget {
   }
 }
 
-/// Six views: Sheet (writing), Graph (word network), Banned (forbidden),
-/// Grammar (structures), Practice (spaced repetition), Cards (flash cards).
+/// Seven views: Sheet (writing), Graph (word network), Banned (forbidden),
+/// Grammar (structures), Practice (spaced repetition), Cards (flash cards),
+/// Blast (picture typing game).
 class HomeShell extends StatefulWidget {
   final StorageService? storage;
   const HomeShell({super.key, this.storage});
@@ -95,6 +100,10 @@ class _HomeShellState extends State<HomeShell> {
   final GlobalKey<SheetViewState> _sheetKey = GlobalKey<SheetViewState>();
   final GlobalKey<FlashCardViewState> _flashKey =
       GlobalKey<FlashCardViewState>();
+  final GlobalKey<BlastViewState> _blastKey = GlobalKey<BlastViewState>();
+
+  /// While true, the Graph page is the Blast bundle's picture picker.
+  bool _pickingForBlast = false;
 
   /// Forbidden words, shared live with the writing + banned views.
   final List<String> _forbidden = [];
@@ -147,6 +156,27 @@ class _HomeShellState extends State<HomeShell> {
     _flashKey.currentState?.requestNewBundle(word);
   }
 
+  /// Blast page: open the real Graph page so the user can tap picture
+  /// words. Reusing that page (instead of a second one in a dialog) keeps
+  /// browser-picked pictures visible and pickable.
+  void _startBlastPicking() {
+    setState(() {
+      _pickingForBlast = true;
+      _tab = 1;
+    });
+  }
+
+  void _doneBlastPicking() {
+    setState(() {
+      _pickingForBlast = false;
+      _tab = 6;
+    });
+  }
+
+  void _blastPicked(String? word) {
+    if (word != null) _blastKey.currentState?.addPickedWord(word);
+  }
+
   /// Small floating nav pill (always on top of the current tab).
   Widget _navPill() {
     return Material(
@@ -160,7 +190,12 @@ class _HomeShellState extends State<HomeShell> {
           border: Border.all(color: PaperTheme.lineThin),
           borderRadius: BorderRadius.circular(24),
         ),
-        child: Row(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+              maxWidth: (MediaQuery.sizeOf(context).width - 32).clamp(200.0, 700.0)),
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
             _pillItem(0, Icons.edit_note, 'Sheet'),
@@ -169,7 +204,10 @@ class _HomeShellState extends State<HomeShell> {
             _pillItem(3, Icons.spellcheck, 'Grammar'),
             _pillItem(4, Icons.repeat_outlined, 'Practice'),
             _pillItem(5, Icons.style, 'Cards'),
+            _pillItem(6, Icons.keyboard, 'Blast'),
           ],
+            ),
+          ),
         ),
       ),
     );
@@ -178,7 +216,10 @@ class _HomeShellState extends State<HomeShell> {
   Widget _pillItem(int index, IconData icon, String label) {
     final active = _tab == index;
     return InkWell(
-      onTap: () => setState(() => _tab = index),
+      onTap: () => setState(() {
+            _pickingForBlast = false; // leaving the map ends pick mode
+            _tab = index;
+          }),
       borderRadius: BorderRadius.circular(18),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
@@ -260,6 +301,13 @@ class _HomeShellState extends State<HomeShell> {
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
                   onFlashCards: _startFlashCards,
+                  pickerHint: _pickingForBlast
+                      ? 'Tap picture words to add them to your Blast bundle'
+                      : null,
+                  onSelectionChanged:
+                      _pickingForBlast ? _blastPicked : null,
+                  onDonePicking:
+                      _pickingForBlast ? _doneBlastPicking : null,
                 ),
                 ForbiddenPage(storage: _storage, words: _forbidden),
                 GrammarPage(storage: _storage),
@@ -273,6 +321,13 @@ class _HomeShellState extends State<HomeShell> {
                   storage: _storage,
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
+                ),
+                BlastView(
+                  key: _blastKey,
+                  storage: _storage,
+                  graph: _graph,
+                  onGraphChanged: _onGraphChanged,
+                  onRequestPick: _startBlastPicking,
                 ),
               ],
             ),
