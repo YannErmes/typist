@@ -146,6 +146,16 @@ class BlastGameState extends State<BlastGame>
   @visibleForTesting
   int get debugChainLength => _game.chain.length;
 
+  @visibleForTesting
+  void debugHover(String word) {
+    for (final ball in _game.chain) {
+      if (ball.word == word) {
+        _game.hoverPoint = Offset(ball.x, ball.y);
+        return;
+      }
+    }
+  }
+
   void _quit() {
     _ticker.stop();
     _game.stop();
@@ -178,36 +188,116 @@ class BlastGameState extends State<BlastGame>
                     (_game.h - h).abs() > 0.5) {
                   _game.resize(side, h);
                 }
-                return SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const SizedBox(height: 10),
-                      MouseRegion(
-                        onHover: (e) => _game.hoverPoint = e.localPosition,
-                        onExit: (_) => _game.hoverPoint = null,
-                        child: SizedBox(
-                          width: side,
-                          height: h,
-                          child: _buildStage(side, h),
+                final gutter = (cons.maxWidth - side) / 2;
+                final hovered = _game.hoveredBall;
+                final showPreview = gutter >= 235 && hovered != null;
+                return Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const SizedBox(height: 10),
+                          MouseRegion(
+                            onHover: (e) => _game.hoverPoint = e.localPosition,
+                            onExit: (_) => _game.hoverPoint = null,
+                            child: SizedBox(
+                              width: side,
+                              height: h,
+                              child: _buildStage(side, h),
+                            ),
+                          ),
+                          Padding(
+                            padding: const EdgeInsets.all(10),
+                            child: Text(
+                              'hover a ball to see it bigger  ·  type the name'
+                              ' to fire  ·  ENTER for EMP  ·  Esc to pause',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(
+                                  color: PaperTheme.inkSoft, fontSize: 11),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    // The board stays centred; the preview lives in the
+                    // empty gutter on the right when there is room.
+                    if (cons.maxWidth >= 700)
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: Padding(
+                          padding: const EdgeInsets.only(right: 18),
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 160),
+                            child: showPreview
+                                ? _buildPreview(hovered)
+                                : const SizedBox.shrink(),
+                          ),
                         ),
                       ),
-                      Padding(
-                        padding: const EdgeInsets.all(10),
-                        child: Text(
-                          'type the picture’s name to fire  ·  ENTER for EMP'
-                          '  ·  Esc to pause',
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                              color: PaperTheme.inkSoft, fontSize: 11),
-                        ),
-                      ),
-                    ],
-                  ),
+                  ],
                 );
               },
             ),
           ),
+        ),
+      ),
+    );
+  }
+
+  /// Large read-only preview of the hovered ball, shown in the free space
+  /// beside the board. IgnorePointer keeps the mouse on the game itself.
+  Widget _buildPreview(String word) {
+    final image = _images[word];
+    return IgnorePointer(
+      key: ValueKey<String>(word),
+      child: Container(
+        width: 210,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: PaperTheme.paper,
+          border: Border.all(color: PaperTheme.lineThin),
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: const Color(0xFF3E3A31).withValues(alpha: 0.14),
+              blurRadius: 12,
+              offset: const Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('PREVIEW',
+                style: TextStyle(
+                    color: PaperTheme.inkSoft,
+                    fontSize: 10,
+                    letterSpacing: 1.4)),
+            const SizedBox(height: 8),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(10),
+              child: Container(
+                width: 186,
+                height: 186,
+                color: PaperTheme.surface,
+                child: image == null
+                    ? const Icon(Icons.image_outlined,
+                        size: 40, color: PaperTheme.inkSoft)
+                    : RawImage(image: image, fit: BoxFit.cover),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              word,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                  color: PaperTheme.ink,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w700),
+            ),
+          ],
         ),
       ),
     );

@@ -274,6 +274,14 @@ void main() {
     expect(game.debugChainLength, greaterThan(0),
         reason: 'a picture ball must spawn before it can be typed');
 
+    // Hovering shows a big preview in the empty side space.
+    game.debugHover('house');
+    for (var i = 0; i < 20; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(find.text('PREVIEW'), findsOneWidget);
+    expect(find.text('house'), findsWidgets);
+
     game.debugType('house');
     for (var i = 0; i < 90; i++) {
       await tester.pump(const Duration(milliseconds: 16));
