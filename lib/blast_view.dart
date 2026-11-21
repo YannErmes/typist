@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'blast_demo.dart';
 import 'blast_game.dart';
 import 'blast_image.dart';
 import 'blast_model.dart';
@@ -106,6 +107,24 @@ class BlastViewState extends State<BlastView> {
       _editing = bundle;
       _titleCtrl.text = bundle.title == 'Untitled bundle' ? '' : bundle.title;
     });
+  }
+
+  /// Adds ready-made picture bundles so the shooting game can be tried
+  /// immediately. Existing bundles are never overwritten.
+  Future<void> _loadDemo() async {
+    final demos = blastDemoBundles();
+    final have = _bundles.map((b) => b.id).toSet();
+    final missing = demos.where((b) => !have.contains(b.id)).toList();
+    if (missing.isEmpty) {
+      _notice('Demo bundles are already in your library.');
+      return;
+    }
+    final next = [...missing, ..._bundles];
+    await widget.storage.saveBlastBundles(next);
+    if (!mounted) return;
+    setState(() => _bundles = next);
+    _notice('Added ${missing.length} demo bundles '
+        '(${missing.fold<int>(0, (n, b) => n + b.items.length)} pictures).');
   }
 
   void _openEditor(BlastBundle bundle) {
@@ -447,6 +466,15 @@ class BlastViewState extends State<BlastView> {
                         ],
                       ),
                     ),
+                    OutlinedButton.icon(
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: PaperTheme.ink,
+                      ),
+                      onPressed: _loadDemo,
+                      icon: const Icon(Icons.auto_awesome_outlined, size: 15),
+                      label: const Text('Load demo bundles'),
+                    ),
+                    const SizedBox(width: 8),
                     FilledButton.icon(
                       style: FilledButton.styleFrom(
                         backgroundColor: PaperTheme.ink,

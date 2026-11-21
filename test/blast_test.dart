@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:word_graph_tool/blast_demo.dart';
 import 'package:word_graph_tool/blast_game.dart';
 import 'package:word_graph_tool/blast_model.dart';
 import 'package:word_graph_tool/blast_view.dart';
@@ -98,6 +99,43 @@ void main() {
     final back = await s.loadBlastBundles();
     expect(back.single.title, 'One');
     expect(back.single.items.single.word, 'house');
+  });
+
+  test('demo bundles provide many named pictures, including two-part names',
+      () {
+    final demos = blastDemoBundles();
+    expect(demos.length, 3);
+    final items = demos.expand((b) => b.items).toList();
+    expect(items.length, greaterThanOrEqualTo(30));
+    expect(items.every((i) => i.image.startsWith('data:image/png;base64,')),
+        isTrue);
+    expect(items.map((i) => i.word), contains('blue square'));
+    expect(items.map((i) => i.word), contains('ocean blue'));
+    expect(demos.map((b) => b.id).toSet().length, 3);
+  });
+
+  testWidgets('Load demo bundles fills an empty library',
+      (WidgetTester tester) async {
+    await wide(tester);
+    final storage = StorageService();
+    final graph = WordGraph();
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: BlastView(
+            storage: storage,
+            graph: graph,
+            onGraphChanged: () {},
+            onRequestPick: () {}),
+      ),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    await tester.tap(find.text('Load demo bundles'));
+    await tester.pump(const Duration(milliseconds: 500));
+    expect(find.text('Shape shots'), findsNWidgets(2)); // rail + card
+    expect(find.text('Pattern pack'), findsNWidgets(2));
+    final saved = await storage.loadBlastBundles();
+    expect(saved.length, 3);
+    expect(saved.expand((b) => b.items).length, greaterThanOrEqualTo(30));
   });
 
   testWidgets('Pick from map adds words that have a picture',
@@ -280,7 +318,8 @@ void main() {
       await tester.pump(const Duration(milliseconds: 16));
     }
     expect(find.text('PREVIEW'), findsOneWidget);
-    expect(find.text('house'), findsWidgets);
+    // The preview must NOT reveal the word — that is what the player types.
+    expect(find.text('house'), findsNothing);
 
     game.debugType('house');
     for (var i = 0; i < 90; i++) {

@@ -288,15 +288,8 @@ class BlastGameState extends State<BlastGame>
                     : RawImage(image: image, fit: BoxFit.cover),
               ),
             ),
-            const SizedBox(height: 10),
-            Text(
-              word,
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                  color: PaperTheme.ink,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w700),
-            ),
+            // No name here on purpose: the player has to recognise the
+            // picture from the image alone to type it.
           ],
         ),
       ),
