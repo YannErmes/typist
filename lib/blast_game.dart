@@ -109,11 +109,14 @@ class BlastGameState extends State<BlastGame>
       key = 'enter';
     } else if (log == LogicalKeyboardKey.escape) {
       key = 'escape';
-    } else if (log == LogicalKeyboardKey.keyP) {
-      key = 'p';
+    } else if (log == LogicalKeyboardKey.space) {
+      // Two-part names such as "garbage disposal" need a space.
+      key = ' ';
     } else {
       final ch = event.character;
-      if (ch != null && ch.length == 1 && RegExp(r'[a-zA-Z0-9]').hasMatch(ch)) {
+      if (ch != null &&
+          ch.length == 1 &&
+          RegExp(r'[a-zA-Z0-9 ]').hasMatch(ch)) {
         key = ch.toLowerCase();
       }
     }
@@ -128,7 +131,7 @@ class BlastGameState extends State<BlastGame>
   @visibleForTesting
   void debugType(String text) {
     for (final ch in text.split('')) {
-      if (RegExp(r'[a-zA-Z0-9]').hasMatch(ch)) {
+      if (RegExp(r'[a-zA-Z0-9 ]').hasMatch(ch)) {
         _game.onKey(ch.toLowerCase());
       }
     }
@@ -180,10 +183,14 @@ class BlastGameState extends State<BlastGame>
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const SizedBox(height: 10),
-                      SizedBox(
-                        width: side,
-                        height: h,
-                        child: _buildStage(side, h),
+                      MouseRegion(
+                        onHover: (e) => _game.hoverPoint = e.localPosition,
+                        onExit: (_) => _game.hoverPoint = null,
+                        child: SizedBox(
+                          width: side,
+                          height: h,
+                          child: _buildStage(side, h),
+                        ),
                       ),
                       Padding(
                         padding: const EdgeInsets.all(10),
@@ -611,6 +618,10 @@ class _Game {
   /// Sound hook; the widget wires this to the platform sound engine.
   void Function(String effect)? onSound;
 
+  /// Pointer position inside the stage, for the gentle hover magnifier.
+  Offset? hoverPoint;
+  String? hoveredBall;
+
   double w = 400;
   double h = 533;
   double cx = 0;
@@ -800,7 +811,7 @@ class _Game {
 
   void onKey(String key) {
     if (!running) return;
-    if (key == 'escape' || key == 'p') {
+    if (key == 'escape') {
       if (!over) togglePause();
       return;
     }
@@ -1060,12 +1071,34 @@ class _Game {
 
   // ---- Drawing ----
 
+  void _updateHover() {
+    final p = hoverPoint;
+    hoveredBall = null;
+    if (p == null) return;
+    var best = double.infinity;
+    for (final b in chain) {
+      final dx = b.x - p.dx;
+      final dy = b.y - p.dy;
+      final d = math.sqrt(dx * dx + dy * dy);
+      if (d <= b.r * b.scale + 6 && d < best) {
+        best = d;
+        hoveredBall = b.word;
+      }
+    }
+  }
+
   void draw(Canvas c) {
+    _updateHover();
     _drawBackground(c);
     _drawTrack(c);
     _drawExit(c);
+    // Hovered ball goes last, so its enlarged picture is never hidden by
+    // the rest of the chain.
     for (final b in chain) {
-      _drawBall(c, b);
+      if (b.word != hoveredBall) _drawBall(c, b);
+    }
+    for (final b in chain) {
+      if (b.word == hoveredBall) _drawBall(c, b, zoom: 1.45);
     }
     for (final corpse in corpses) {
       final a = (corpse.life / 0.28).clamp(0.0, 1.0);
@@ -1242,9 +1275,10 @@ class _Game {
     c.restore();
   }
 
-  void _drawBall(Canvas c, _Ball b) {
+  void _drawBall(Canvas c, _Ball b, {double zoom = 1}) {
     final targeted = b.word == targetId;
-    final r = b.r * b.scale;
+    final s = b.scale * zoom;
+    final r = b.r * s;
     c.save();
     c.translate(b.x, b.y);
 
@@ -1269,7 +1303,7 @@ class _Game {
     c.drawCircle(Offset.zero, r, Paint()..shader = body);
 
     c.save();
-    c.scale(b.scale, b.scale);
+    c.scale(s, s);
     c.clipPath(Path()
       ..addOval(Rect.fromCircle(center: Offset.zero, radius: math.max(0.5, b.r - 1))));
     final image = images[b.word];

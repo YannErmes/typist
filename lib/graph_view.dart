@@ -2391,7 +2391,7 @@ class _MiniField extends StatelessWidget {
 }
 
 /// Soft rounded mind-map bubble (or picture card).
-class _MapNode extends StatelessWidget {
+class _MapNode extends StatefulWidget {
   final String word;
   final Color fill;
   final bool isCenter;
@@ -2405,7 +2405,9 @@ class _MapNode extends StatelessWidget {
       this.picture});
 
   @override
-  Widget build(BuildContext context) {
+  State<_MapNode> createState() => _MapNodeState();
+
+  Widget buildNode(BuildContext context) {
     final pic = picture;
     if (pic != null) {
       return Container(
@@ -2485,6 +2487,26 @@ class _MapNode extends StatelessWidget {
             ),
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// A gentle hover magnifier so a small picture can be read without
+/// covering the rest of the map. Only picture nodes grow.
+class _MapNodeState extends State<_MapNode> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: AnimatedScale(
+        scale: widget.picture != null && _hover ? 1.2 : 1.0,
+        duration: const Duration(milliseconds: 140),
+        curve: Curves.easeOut,
+        child: widget.buildNode(context),
       ),
     );
   }

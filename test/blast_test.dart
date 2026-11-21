@@ -199,6 +199,46 @@ void main() {
     );
   });
 
+  testWidgets('two-part picture names can be typed and blasted',
+      (WidgetTester tester) async {
+    await wide(tester);
+    final storage = StorageService();
+    final graph = WordGraph();
+    await storage.saveBlastBundles([
+      BlastBundle(
+        id: 'b2',
+        title: 'Two-part',
+        items: const [
+          BlastItem(word: 'garbage disposal', image: 'images/gd.jpg'),
+        ],
+      ),
+    ]);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: BlastView(
+            storage: storage,
+            graph: graph,
+            onGraphChanged: () {},
+            onRequestPick: () {}),
+      ),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    await tester.tap(find.text('Play'));
+    for (var i = 0; i < 150; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    final game = tester.state<BlastGameState>(find.byType(BlastGame));
+    expect(game.debugChainLength, greaterThan(0));
+
+    // The space between the two parts must be part of the typed word,
+    // and a "p" in "disposal" must not be mistaken for the pause key.
+    game.debugType('garbage disposal');
+    for (var i = 0; i < 90; i++) {
+      await tester.pump(const Duration(milliseconds: 16));
+    }
+    expect(game.debugScore, greaterThan(0));
+  });
+
   testWidgets('typing a picture word fires and scores',
       (WidgetTester tester) async {
     await wide(tester);
