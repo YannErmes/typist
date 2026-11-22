@@ -140,6 +140,7 @@ class StorageService {
   List<String> _memoryForbidden = [];
   List<Map<String, dynamic>> _memoryFlashBundles = [];
   List<Map<String, dynamic>> _memoryFlashSentences = [];
+  List<Map<String, dynamic>> _memoryFlashCards = [];
   List<Map<String, dynamic>> _memoryBlastBundles = [];
 
   /// True when running without a real folder (browser preview).
@@ -540,6 +541,7 @@ class StorageService {
       return {
         'bundles': List<Map<String, dynamic>>.of(_memoryFlashBundles),
         'sentences': List<Map<String, dynamic>>.of(_memoryFlashSentences),
+        'cards': List<Map<String, dynamic>>.of(_memoryFlashCards),
       };
     }
     try {
@@ -561,6 +563,10 @@ class StorageService {
       ];
       _memoryFlashSentences = [
         for (final e in (raw['sentences'] is List ? raw['sentences'] as List : const []))
+          if (e is Map) Map<String, dynamic>.from(e),
+      ];
+      _memoryFlashCards = [
+        for (final e in (raw['cards'] is List ? raw['cards'] as List : const []))
           if (e is Map) Map<String, dynamic>.from(e),
       ];
       return;
@@ -610,6 +616,67 @@ class StorageService {
     final raw = await _readFlashRaw();
     raw['sentences'] = [for (final s in sentences) s.toJson()];
     await _writeFlashRaw(raw);
+  }
+
+  /// Forced-retrieval cards, in deck order. Legacy bundles are migrated the
+  /// first time this is called: each distinct word becomes a card with its
+  /// `target` set and empty scenario/question, ready for the user to fill in.
+  /// Old data is left in the file; only the new `cards` key is written.
+  Future<List<FlashCard>> loadFlashCards() async {
+    final raw = await _readFlashRaw();
+    final stored = _flashList(raw['cards']);
+    if (stored.isEmpty) {
+      final migrated = <FlashCard>[];
+      final seen = <String>{};
+      for (final e in _flashList(raw['bundles'])) {
+        final bundle = FlashBundle.fromJson(e);
+        if (bundle == null) continue;
+        for (final word in bundle.words) {
+          final key = word.trim();
+          if (key.isEmpty || !seen.add(key.toLowerCase())) continue;
+          migrated.add(FlashCard(
+            id: 'fc-migrate-${migrated.length}',
+            target: key,
+          ));
+        }
+      }
+      if (migrated.isNotEmpty) {
+        raw['cards'] = [for (final c in migrated) c.toJson()];
+        await _writeFlashRaw(raw);
+      }
+      return migrated;
+    }
+    final out = <FlashCard>[];
+    for (final e in stored) {
+      final card = FlashCard.fromJson(e);
+      if (card != null) out.add(card);
+    }
+    return out;
+  }
+
+  Future<void> saveFlashCards(List<FlashCard> cards) async {
+    final raw = await _readFlashRaw();
+    raw['cards'] = [for (final c in cards) c.toJson()];
+    await _writeFlashRaw(raw);
+  }
+
+  // ---- Blast track preferences ----
+  static const _kBlastTurns = 'blastTurns';
+  static const _kBlastShape = 'blastShape';
+
+  Future<BlastTrack> loadBlastTrack() async {
+    final settings = await loadSettings();
+    final raw = settings[_kBlastTurns];
+    final turns = raw is num ? raw.toDouble() : BlastTrack.defaultTurns;
+    final shape = BlastShape.fromId(settings[_kBlastShape] as String?);
+    return BlastTrack(turns: turns, shape: shape);
+  }
+
+  Future<void> saveBlastTrack(BlastTrack track) async {
+    final settings = await loadSettings();
+    settings[_kBlastTurns] = track.turns;
+    settings[_kBlastShape] = track.shape.id;
+    await saveSettings(settings);
   }
 
   // ---- Blast typing-game bundles ----

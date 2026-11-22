@@ -286,10 +286,18 @@ class BlastViewState extends State<BlastView> {
       }
     }
     if (playing != null) {
-      return BlastGame(
-        storage: widget.storage,
-        bundle: playing,
-        onExit: () => setState(() => _playingId = null),
+      return FutureBuilder<BlastTrack>(
+        future: widget.storage.loadBlastTrack(),
+        builder: (context, snap) {
+          final track = snap.data ?? const BlastTrack();
+          return BlastGame(
+            storage: widget.storage,
+            bundle: playing!,
+            track: track,
+            onTrackChanged: widget.storage.saveBlastTrack,
+            onExit: () => setState(() => _playingId = null),
+          );
+        },
       );
     }
     return Container(

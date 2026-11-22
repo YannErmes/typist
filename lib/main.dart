@@ -94,6 +94,9 @@ class HomeShell extends StatefulWidget {
   State<HomeShell> createState() => _HomeShellState();
 }
 
+/// Which page is currently using the Graph page as a picker.
+enum _PickPurpose { none, blast, flash }
+
 class _HomeShellState extends State<HomeShell> {
   late final StorageService _storage;
   final WordGraph _graph = WordGraph();
@@ -102,8 +105,8 @@ class _HomeShellState extends State<HomeShell> {
       GlobalKey<FlashCardViewState>();
   final GlobalKey<BlastViewState> _blastKey = GlobalKey<BlastViewState>();
 
-  /// While true, the Graph page is the Blast bundle's picture picker.
-  bool _pickingForBlast = false;
+  /// Why the Graph page is currently acting as a picker for another page.
+  _PickPurpose _pickPurpose = _PickPurpose.none;
 
   /// Forbidden words, shared live with the writing + banned views.
   final List<String> _forbidden = [];
@@ -148,12 +151,32 @@ class _HomeShellState extends State<HomeShell> {
     _sheetKey.currentState?.refreshGraph();
   }
 
-  /// Graph page: start a flash-card bundle around the selected word and
-  /// bring the Cards page forward to name it. The page stays alive in the
-  /// IndexedStack, so its state is ready to receive the request.
+  /// Graph page: start a new flash card with the selected word as target.
+  /// The page stays alive in the IndexedStack, so its state is ready.
   void _startFlashCards(String word) {
     setState(() => _tab = 5);
-    _flashKey.currentState?.requestNewBundle(word);
+    _flashKey.currentState?.beginNewCardWithTarget(word);
+  }
+
+  /// Cards page: open the real Graph page to choose a target word.
+  void _startFlashPicking() {
+    setState(() {
+      _pickPurpose = _PickPurpose.flash;
+      _tab = 1;
+    });
+  }
+
+  void _doneFlashPicking() {
+    setState(() {
+      _pickPurpose = _PickPurpose.none;
+      _tab = 5;
+    });
+  }
+
+  void _flashPicked(String? word) {
+    if (word == null) return;
+    _flashKey.currentState?.applyPickedTarget(word);
+    _doneFlashPicking(); // one selection is enough — straight back to editor
   }
 
   /// Blast page: open the real Graph page so the user can tap picture
@@ -161,14 +184,14 @@ class _HomeShellState extends State<HomeShell> {
   /// browser-picked pictures visible and pickable.
   void _startBlastPicking() {
     setState(() {
-      _pickingForBlast = true;
+      _pickPurpose = _PickPurpose.blast;
       _tab = 1;
     });
   }
 
   void _doneBlastPicking() {
     setState(() {
-      _pickingForBlast = false;
+      _pickPurpose = _PickPurpose.none;
       _tab = 6;
     });
   }
@@ -217,7 +240,7 @@ class _HomeShellState extends State<HomeShell> {
     final active = _tab == index;
     return InkWell(
       onTap: () => setState(() {
-            _pickingForBlast = false; // leaving the map ends pick mode
+            _pickPurpose = _PickPurpose.none; // leaving the map ends picking
             _tab = index;
           }),
       borderRadius: BorderRadius.circular(18),
@@ -301,13 +324,23 @@ class _HomeShellState extends State<HomeShell> {
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
                   onFlashCards: _startFlashCards,
-                  pickerHint: _pickingForBlast
-                      ? 'Tap picture words to add them to your Blast bundle'
-                      : null,
-                  onSelectionChanged:
-                      _pickingForBlast ? _blastPicked : null,
-                  onDonePicking:
-                      _pickingForBlast ? _doneBlastPicking : null,
+                  pickerHint: switch (_pickPurpose) {
+                    _PickPurpose.blast =>
+                      'Tap picture words to add them to your Blast bundle',
+                    _PickPurpose.flash =>
+                      'Tap the word to use as your flash card target',
+                    _PickPurpose.none => null,
+                  },
+                  onSelectionChanged: switch (_pickPurpose) {
+                    _PickPurpose.blast => _blastPicked,
+                    _PickPurpose.flash => _flashPicked,
+                    _PickPurpose.none => null,
+                  },
+                  onDonePicking: switch (_pickPurpose) {
+                    _PickPurpose.blast => _doneBlastPicking,
+                    _PickPurpose.flash => _doneFlashPicking,
+                    _PickPurpose.none => null,
+                  },
                 ),
                 ForbiddenPage(storage: _storage, words: _forbidden),
                 GrammarPage(storage: _storage),
@@ -321,6 +354,7 @@ class _HomeShellState extends State<HomeShell> {
                   storage: _storage,
                   graph: _graph,
                   onGraphChanged: _onGraphChanged,
+                  onRequestPick: _startFlashPicking,
                 ),
                 BlastView(
                   key: _blastKey,

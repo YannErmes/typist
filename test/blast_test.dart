@@ -321,10 +321,97 @@ void main() {
     // The preview must NOT reveal the word — that is what the player types.
     expect(find.text('house'), findsNothing);
 
-    game.debugType('house');
+    game.debugType('hous');
+    expect(game.debugTyped, 'hous');
+    // A wrong letter must be ignored, NOT wipe what was already typed.
+    game.debugType('z');
+    expect(game.debugTyped, 'hous',
+        reason: 'a mistake should keep the typed prefix for correction');
+    // Typing the right letter finishes the word.
+    game.debugType('e');
     for (var i = 0; i < 90; i++) {
       await tester.pump(const Duration(milliseconds: 16));
     }
     expect(game.debugScore, greaterThan(0));
+  });
+
+  test('each track shape draws a genuinely different path', () {
+    final samples = <String>{};
+    for (final shape in BlastShape.values) {
+      final pts = debugBlastPath(shape, 2.35);
+      final p = pts[(pts.length * 0.5).round()];
+      samples.add('${p.dx.toStringAsFixed(0)},${p.dy.toStringAsFixed(0)}');
+      expect(p.dx, greaterThanOrEqualTo(0),
+          reason: '${shape.label} path should stay inside the board');
+      expect(p.dx, lessThanOrEqualTo(400));
+      expect(p.dy, greaterThanOrEqualTo(0));
+      expect(p.dy, lessThanOrEqualTo(533));
+    }
+    expect(samples.length, greaterThanOrEqualTo(4),
+        reason: 'shapes must not all draw the same curve');
+  });
+
+  test('blast track preferences round-trip', () async {
+    final s = StorageService();
+    final initial = await s.loadBlastTrack();
+    expect(initial.turns, BlastTrack.defaultTurns);
+    expect(initial.shape, BlastShape.spiral);
+
+    await s.saveBlastTrack(const BlastTrack(
+      turns: 3.2,
+      shape: BlastShape.figure8,
+    ));
+    final back = await s.loadBlastTrack();
+    expect(back.turns, 3.2);
+    expect(back.shape, BlastShape.figure8);
+    expect(BlastShape.fromId('flat'), BlastShape.oval); // old migration
+    expect(BlastShape.values.length, 6);
+  });
+
+  testWidgets('track settings change spiral length and shape',
+      (WidgetTester tester) async {
+    await wide(tester);
+    final storage = StorageService();
+    final graph = WordGraph();
+    await storage.saveBlastBundles([
+      BlastBundle(
+        id: 'b3',
+        title: 'Track',
+        items: const [BlastItem(word: 'house', image: 'images/h.jpg')],
+      ),
+    ]);
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: BlastView(
+            storage: storage,
+            graph: graph,
+            onGraphChanged: () {},
+            onRequestPick: () {}),
+      ),
+    ));
+    await tester.pump(const Duration(seconds: 2));
+    await tester.tap(find.text('Play'));
+    await tester.pump(const Duration(milliseconds: 300));
+
+    final game = tester.state<BlastGameState>(find.byType(BlastGame));
+    expect(game.debugTurns, BlastTrack.defaultTurns);
+    expect(game.debugShape, BlastShape.spiral);
+
+    await tester.tap(find.byTooltip('Track settings'));
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(find.text('Track settings'), findsOneWidget);
+
+    await tester.tap(find.text('Long'));
+    await tester.pump();
+    expect(game.debugTurns, 3.2);
+    await tester.tap(find.text('Figure 8'));
+    await tester.pump();
+    expect(game.debugShape, BlastShape.figure8);
+
+    await tester.tap(find.text('Done'));
+    await tester.pump();
+    final saved = await storage.loadBlastTrack();
+    expect(saved.turns, 3.2);
+    expect(saved.shape, BlastShape.figure8);
   });
 }

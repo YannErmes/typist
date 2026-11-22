@@ -12,6 +12,18 @@ import 'blast_sound.dart';
 import 'storage.dart';
 import 'theme.dart';
 
+/// Sample points of a track layout, for tests that verify the shapes are
+/// genuinely different curves rather than one path with a tweak.
+@visibleForTesting
+List<Offset> debugBlastPath(BlastShape shape, double turns) {
+  final game = _Game(
+    [const BlastItem(word: 'x', image: 'data:,')],
+    const {},
+    track: BlastTrack(turns: turns, shape: shape),
+  );
+  return [for (final p in game.path) Offset(p.x, p.y)];
+}
+
 /// Flutter port of the TYPE//BLAST shooter: picture balls crawl a spiral
 /// toward the exit, and typing a word launches the idol's bolt at it.
 /// Drawn in the app's paper palette so it sits naturally as one more page.
@@ -19,12 +31,16 @@ class BlastGame extends StatefulWidget {
   final StorageService storage;
   final BlastBundle bundle;
   final VoidCallback onExit;
+  final BlastTrack track;
+  final ValueChanged<BlastTrack> onTrackChanged;
 
   const BlastGame({
     super.key,
     required this.storage,
     required this.bundle,
     required this.onExit,
+    required this.track,
+    required this.onTrackChanged,
   });
 
   @override
@@ -39,11 +55,14 @@ class BlastGameState extends State<BlastGame>
   final FocusNode _focus = FocusNode();
   final Map<String, ui.Image> _images = {};
   final BlastSound _sound = BlastSound();
+  late BlastTrack _track;
+  bool _showTrackSettings = false;
 
   @override
   void initState() {
     super.initState();
-    _game = _Game(widget.bundle.items, _images)
+    _track = widget.track;
+    _game = _Game(widget.bundle.items, _images, track: widget.track)
       ..onSound = _sound.play;
     _ticker = createTicker(_onTick)..start();
     _loadImages();
@@ -126,6 +145,14 @@ class BlastGameState extends State<BlastGame>
     return KeyEventResult.handled;
   }
 
+  void _applyTrack(BlastTrack track) {
+    setState(() {
+      _track = track;
+      _game.setTrack(track);
+    });
+    widget.onTrackChanged(track);
+  }
+
   /// Test hook: type a word without needing a physical keyboard in the
   /// widget sandbox (the real page uses [Focus.onKeyEvent]).
   @visibleForTesting
@@ -136,6 +163,19 @@ class BlastGameState extends State<BlastGame>
       }
     }
   }
+
+  @visibleForTesting
+  String get debugTyped => _game.typed;
+
+  @visibleForTesting
+  double get debugTurns => _game.turns;
+
+  @visibleForTesting
+  BlastShape get debugShape => _game.shape;
+
+  @visibleForTesting
+  List<Offset> get debugPathPoints =>
+      [for (final p in _game.path) Offset(p.x, p.y)];
 
   @visibleForTesting
   int get debugScore => _game.score;
@@ -339,6 +379,13 @@ class BlastGameState extends State<BlastGame>
               ),
               const SizedBox(width: 8),
               _iconButton(
+                icon: Icons.tune,
+                tooltip: 'Track settings',
+                onTap: () =>
+                    setState(() => _showTrackSettings = true),
+              ),
+              const SizedBox(width: 8),
+              _iconButton(
                 icon: _sound.muted ? Icons.volume_off : Icons.volume_up,
                 tooltip: _sound.muted ? 'Unmute' : 'Mute',
                 onTap: () {
@@ -406,17 +453,25 @@ class BlastGameState extends State<BlastGame>
             ],
           ),
         ),
-        // Typing bar + EMP badge.
+        // Typed word sits at the TOP, above the board.
         Positioned(
           left: 10,
           right: 10,
-          bottom: 10,
+          top: 84,
           child: Column(
             children: [
-              SizedBox(
-                height: 24,
+              Container(
+                constraints: const BoxConstraints(minHeight: 30),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 12, vertical: 3),
+                decoration: BoxDecoration(
+                  color: PaperTheme.surface.withValues(alpha: 0.88),
+                  border: Border.all(color: PaperTheme.lineThin),
+                  borderRadius: BorderRadius.circular(9),
+                ),
                 child: Text(
-                  _game.typed.toUpperCase(),
+                  _game.typed.isEmpty ? '…' : _game.typed.toUpperCase(),
+                  textAlign: TextAlign.center,
                   style: const TextStyle(
                       color: Color(0xFF8A621E),
                       fontSize: 18,
@@ -424,6 +479,7 @@ class BlastGameState extends State<BlastGame>
                       fontWeight: FontWeight.w700),
                 ),
               ),
+              const SizedBox(height: 6),
               Row(
                 children: [
                   GestureDetector(
@@ -461,6 +517,8 @@ class BlastGameState extends State<BlastGame>
                     letterSpacing: 6,
                     fontWeight: FontWeight.w800)),
           ),
+        if (_showTrackSettings && !_game.over)
+          _trackSettingsOverlay(),
         if (_game.paused && !_game.over)
           _overlay([
             const Text('Paused',
@@ -488,6 +546,109 @@ class BlastGameState extends State<BlastGame>
         if (_game.over) _gameOverOverlay(),
       ],
     );
+  }
+
+  Widget _trackSettingChip({
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(right: 6, bottom: 6),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          decoration: BoxDecoration(
+            color: selected ? PaperTheme.ink : PaperTheme.surface,
+            border: Border.all(color: PaperTheme.lineThin),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color: selected ? PaperTheme.paper : PaperTheme.ink,
+              fontSize: 11.5,
+              fontWeight: selected ? FontWeight.w700 : FontWeight.normal,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _trackSettingsOverlay() {
+    return _overlay([
+      Row(
+        children: [
+          const Expanded(
+            child: Text('Track settings',
+                style: TextStyle(
+                    color: PaperTheme.ink,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700)),
+          ),
+          InkWell(
+            onTap: () => setState(() => _showTrackSettings = false),
+            child: const Icon(Icons.close,
+                size: 18, color: PaperTheme.inkSoft),
+          ),
+        ],
+      ),
+      const SizedBox(height: 12),
+      const Align(
+        alignment: Alignment.centerLeft,
+        child: Text('LENGTH',
+            style: TextStyle(
+                color: PaperTheme.inkSoft,
+                fontSize: 10,
+                letterSpacing: 1.2)),
+      ),
+      const SizedBox(height: 6),
+      Wrap(
+        children: [
+          for (final preset in BlastTrack.lengths)
+            _trackSettingChip(
+              label: preset.label,
+              selected: (_track.turns - preset.turns).abs() < 0.01,
+              onTap: () => _applyTrack(
+                  BlastTrack(turns: preset.turns, shape: _track.shape)),
+            ),
+        ],
+      ),
+      const SizedBox(height: 8),
+      const Align(
+        alignment: Alignment.centerLeft,
+        child: Text('SHAPE',
+            style: TextStyle(
+                color: PaperTheme.inkSoft,
+                fontSize: 10,
+                letterSpacing: 1.2)),
+      ),
+      const SizedBox(height: 6),
+      Wrap(
+        children: [
+          for (final shape in BlastShape.values)
+            _trackSettingChip(
+              label: shape.label,
+              selected: _track.shape == shape,
+              onTap: () => _applyTrack(
+                  BlastTrack(turns: _track.turns, shape: shape)),
+            ),
+        ],
+      ),
+      const SizedBox(height: 6),
+      Text(
+        'length: ${_track.turns.toStringAsFixed(2)} turns · ${_track.shape.label}',
+        style: const TextStyle(color: PaperTheme.inkSoft, fontSize: 10),
+      ),
+      const SizedBox(height: 14),
+      _wideButton('Done', () {
+        _focus.requestFocus();
+        setState(() => _showTrackSettings = false);
+      }),
+    ]);
   }
 
   Widget _gameOverOverlay() {
@@ -711,8 +872,8 @@ class _Game {
   double cy = 0;
   double r0 = 0;
   double r1 = 0;
-  final double yScale = 0.82;
-  final double turns = 2.35;
+  BlastShape shape = BlastShape.spiral;
+  double turns = 2.35;
   List<_Pt> path = [];
   double pathLen = 1;
   double gap = 0.05;
@@ -751,9 +912,18 @@ class _Game {
   double gunTarget = -math.pi / 2;
   double recoil = 0;
 
-  _Game(this.items, this.images) {
+  _Game(this.items, this.images, {BlastTrack? track}) {
+    if (track != null) setTrack(track);
     resize(w, h);
     start();
+  }
+
+  /// Rebuild the track for a new length/shape, keeping balls at their
+  /// current progress (positions are recomputed from each ball's t).
+  void setTrack(BlastTrack track) {
+    turns = track.turns;
+    shape = track.shape;
+    if (w > 0) resize(w, h);
   }
 
   int get accuracy =>
@@ -772,17 +942,10 @@ class _Game {
     cy = h * 0.52;
     r0 = math.min(w * 0.455, h * 0.345);
     r1 = math.max(42, math.min(w, h) * 0.085);
-    const n = 360;
+    const n = 480;
     final pts = <_Pt>[];
     for (var i = 0; i <= n; i++) {
-      final u = i / n;
-      final ang = -math.pi / 2 + u * turns * math.pi * 2;
-      final rad = r0 - (r0 - r1) * u;
-      final pt = _Pt(
-        cx + rad * math.cos(ang),
-        cy + rad * math.sin(ang) * yScale,
-        0,
-      );
+      final pt = _pathPoint(i / n);
       if (pts.isNotEmpty) {
         pt.len = pts.last.len +
             math.sqrt(math.pow(pt.x - pts.last.x, 2) +
@@ -803,6 +966,48 @@ class _Game {
       for (var i = 0; i < 260; i++)
         Offset(_rand.nextDouble() * w, _rand.nextDouble() * h),
     ];
+  }
+
+  /// Point on the chosen track at progress [u] (0 = entry, 1 = exit).
+  _Pt _pathPoint(double u) {
+    final a = -math.pi / 2 + u * turns * math.pi * 2;
+    switch (shape) {
+      case BlastShape.spiral:
+        final rad = r0 - (r0 - r1) * u;
+        return _Pt(cx + rad * math.cos(a), cy + rad * math.sin(a) * 0.82, 0);
+
+      case BlastShape.ring:
+      case BlastShape.oval:
+      case BlastShape.square:
+        // Radius eases in across the loops, so each revolution sits just
+        // inside the previous one (concentric rings, no ball overlap).
+        final rad = r0 - (r0 - r1) * u;
+        if (shape == BlastShape.square) {
+          final ca = math.cos(a);
+          final sa = math.sin(a);
+          final den = math.pow(
+              math.pow(ca.abs(), 4) + math.pow(sa.abs(), 4), 0.25);
+          return _Pt(cx + rad * ca / den, cy + rad * sa / den, 0);
+        }
+        final ys = shape == BlastShape.oval ? 0.52 : 1.0;
+        return _Pt(cx + rad * math.cos(a), cy + rad * math.sin(a) * ys, 0);
+
+      case BlastShape.figure8:
+        // Lemniscate; [turns] sets how many lobes it draws.
+        final q = u * turns * math.pi;
+        final den = 1 + math.pow(math.sin(q), 2);
+        final rx = r0 * 0.92 * math.cos(q) / den;
+        final ry = r0 * 1.1 * math.sin(q) * math.cos(q) / den;
+        return _Pt(cx + rx, cy + ry, 0);
+
+      case BlastShape.wave:
+        // Serpentine: enter at the left, leave at the right, with
+        // [turns] controlling the number of bends.
+        final x = cx - r0 + 2 * r0 * u;
+        final amp = r0 - (r0 - r1) * u * 0.8;
+        final y = cy + amp * math.sin(u * turns * math.pi * 2);
+        return _Pt(x, y, 0);
+    }
   }
 
   _Pt ptAt(double t) {
@@ -909,40 +1114,51 @@ class _Game {
       if (typed.isEmpty) {
         _clearTarget();
       } else {
-        _resolveTarget(true);
+        final cur = targetId == null ? null : _ball(targetId!);
+        if (cur == null || !cur.word.startsWith(typed)) {
+          _clearTarget();
+        } else {
+          for (final b in chain) {
+            b.matched = b.word == targetId ? typed.length : 0;
+          }
+        }
       }
       return;
     }
-    typed += key;
-    _resolveTarget(false);
+    _typeChar(key);
   }
 
-  void _resolveTarget(bool fromBackspace) {
+  /// Try the next letter WITHOUT destroying progress. A wrong key is
+  /// simply ignored (small flash + miss sound): the player keeps what they
+  /// already typed and only needs to enter the correct next letter.
+  void _typeChar(String ch) {
+    final candidate = typed + ch;
     _Ball? target;
     if (targetId != null) {
       final cur = _ball(targetId!);
-      if (cur != null && cur.word.startsWith(typed)) target = cur;
+      if (cur != null && cur.word.startsWith(candidate)) target = cur;
     }
     if (target == null) {
       for (final b in chain) {
-        if (!b.word.startsWith(typed)) continue;
+        if (!b.word.startsWith(candidate)) continue;
         if (target == null || b.t > target.t) target = b;
       }
     }
     if (target == null) {
-      typed = '';
+      // Wrong letter: keep [typed] intact so it can be corrected by
+      // simply typing the right letter (or Backspace).
       misses++;
       combo = 0;
-      _clearTarget();
-      flashRed = 0.35;
+      flashRed = 0.2;
       onSound?.call('miss');
       return;
     }
+    typed = candidate;
     targetId = target.word;
     for (final b in chain) {
       b.matched = b.word == target.word ? typed.length : 0;
     }
-    if (typed.length == 1 && !fromBackspace) onSound?.call('lock');
+    if (typed.length == 1) onSound?.call('lock');
     if (typed == target.word) _launchShot(target);
   }
 
@@ -1267,7 +1483,7 @@ class _Game {
     for (var r = 46.0; r < 150; r += 18) {
       c.drawOval(
           Rect.fromCenter(
-              center: Offset(cx, cy), width: r * 2, height: r * 2 * yScale),
+              center: Offset(cx, cy), width: r * 2, height: r * 2 * 0.82),
           ring);
     }
     final vignette = RadialGradient(

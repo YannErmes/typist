@@ -1,17 +1,106 @@
 /// Data for the flash-card page.
 ///
-/// A [FlashBundle] is one named exercise: a root word plus a snapshot of
-/// every word directly linked to it. Sentences are stored separately and
-/// always keyed by the word they belong to, so the same word can collect
-/// sentences across many bundles over time — flipping any card shows the
-/// whole history, while opening a bundle shows only what was written in it.
+/// A [FlashCard] is one forced-retrieval exercise for a single target word
+/// or expression. The user is given a scenario and a question, answers from
+/// habit, and blocks each default answer until the target is the only thing
+/// left to say. Good answers are deliberately NOT stored — only the count
+/// and the timestamp of the last success survive. The blocked list is the
+/// only list that grows, and nothing clears it automatically.
+library;
+
+/// Number of blocked attempts in a session before the target is revealed.
+/// Change this one constant to make the exercise easier or harder.
+const int kRevealAfterBlocks = 5;
+
+class FlashCard {
+  final String id;
+
+  /// Situation the question is asked in. Empty on migrated old cards until
+  /// the user fills it in.
+  String scenario;
+
+  /// The question asked inside [scenario].
+  String question;
+
+  /// The word or expression to learn. Hidden while answering.
+  String target;
+
+  /// Bad answers the user has blocked. Grows over time, never auto-cleared.
+  final List<String> blocked;
+
+  /// How many times the target was used successfully.
+  int goodCount;
+
+  /// When the target was last used successfully (milliseconds), or null.
+  int? lastGoodAt;
+
+  /// Next review date (milliseconds), or null.
+  int? nextReview;
+
+  FlashCard({
+    required this.id,
+    this.scenario = '',
+    this.question = '',
+    required this.target,
+    List<String>? blocked,
+    this.goodCount = 0,
+    this.lastGoodAt,
+    this.nextReview,
+  }) : blocked = blocked ?? <String>[];
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'scenario': scenario,
+        'question': question,
+        'target': target,
+        'blocked': blocked,
+        'goodCount': goodCount,
+        'lastGoodAt': lastGoodAt,
+        'nextReview': nextReview,
+      };
+
+  static int? _asDate(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is int) return raw;
+    if (raw is String && raw.trim().isNotEmpty) {
+      return int.tryParse(raw.trim());
+    }
+    return null;
+  }
+
+  static FlashCard? fromJson(dynamic raw) {
+    if (raw is! Map) return null;
+    final id = (raw['id'] ?? '').toString().trim();
+    // Old bundles used a `word` field; accept it as a safety net.
+    final target = (raw['target'] ?? raw['word'] ?? '').toString().trim();
+    if (id.isEmpty || target.isEmpty) return null;
+    final blocked = <String>[];
+    for (final b in (raw['blocked'] is List ? raw['blocked'] as List : const [])) {
+      final text = b.toString().trim();
+      if (text.isNotEmpty && !blocked.contains(text)) blocked.add(text);
+    }
+    return FlashCard(
+      id: id,
+      scenario: (raw['scenario'] ?? '').toString(),
+      question: (raw['question'] ?? '').toString(),
+      target: target,
+      blocked: blocked,
+      goodCount: int.tryParse((raw['goodCount'] ?? 0).toString()) ?? 0,
+      lastGoodAt: _asDate(raw['lastGoodAt']),
+      nextReview: _asDate(raw['nextReview']),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy bundle/sentence shapes. Kept so existing flashcards.json files can
+// be migrated; the new UI no longer writes them.
+// ---------------------------------------------------------------------------
+
 class FlashBundle {
   final String id;
   String name;
   final String rootWord;
-
-  /// Card order, fixed when the bundle is created so later map edits do
-  /// not reshuffle an exercise someone is in the middle of.
   final List<String> words;
   final int createdAt;
   int updatedAt;
@@ -59,7 +148,6 @@ class FlashBundle {
   }
 }
 
-/// One sentence written on the back of a word's card during a bundle.
 class FlashSentence {
   final String id;
   final String bundleId;
@@ -106,7 +194,7 @@ class FlashSentence {
   }
 }
 
-/// Short date for a saved sentence (time today, date otherwise).
+/// Human label for a saved date (time today, date otherwise).
 String flashDateLabel(int ms) {
   final dt = DateTime.fromMillisecondsSinceEpoch(ms);
   final now = DateTime.now();
