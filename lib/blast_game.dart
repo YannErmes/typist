@@ -58,12 +58,19 @@ class BlastGameState extends State<BlastGame>
   late BlastTrack _track;
   bool _showTrackSettings = false;
 
+  /// The canvas repaints through this notifier every frame; only real HUD
+  /// changes trigger a (much more expensive) widget rebuild.
+  final ValueNotifier<int> _frame = ValueNotifier<int>(0);
+  late final _GamePainter _painter;
+  String _hudKey = '';
+
   @override
   void initState() {
     super.initState();
     _track = widget.track;
     _game = _Game(widget.bundle.items, _images, track: widget.track)
       ..onSound = _sound.play;
+    _painter = _GamePainter(_game, repaint: _frame);
     _ticker = createTicker(_onTick)..start();
     _loadImages();
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -74,6 +81,8 @@ class BlastGameState extends State<BlastGame>
   @override
   void dispose() {
     _ticker.dispose();
+    _frame.dispose();
+    _game.dispose();
     _focus.dispose();
     _sound.dispose();
     super.dispose();
@@ -112,7 +121,24 @@ class BlastGameState extends State<BlastGame>
     if (_game.running && !_game.paused && !_game.over) {
       _game.update(dt.clamp(0.0, 0.05));
     }
-    if (mounted) setState(() {});
+    if (!mounted) return;
+
+    // Canvas-only refresh for smooth motion.
+    _frame.value++;
+
+    // Widget tree only when something the eye can read actually changes.
+    // Exit risk is bucketed so the bar animates without a rebuild per pixel.
+    final risk = _game.danger > 0.75
+        ? 2
+        : (_game.danger > 0.45 ? 1 : 0);
+    final key = '${_game.score}|${_game.wave}|${_game.combo}|'
+        '${_game.lives}|${_game.emp}|${_game.typed}|'
+        '${_game.over}|${_game.paused}|${_game.waveBanner}|'
+        '${_game.hoveredBall}|$risk|${_images.length}';
+    if (key != _hudKey) {
+      _hudKey = key;
+      setState(() {});
+    }
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
@@ -341,7 +367,7 @@ class BlastGameState extends State<BlastGame>
       children: [
         Positioned.fill(
           child: CustomPaint(
-            painter: _GamePainter(_game),
+            painter: _painter,
             child: const SizedBox.expand(),
           ),
         ),
@@ -770,7 +796,7 @@ class BlastGameState extends State<BlastGame>
 class _GamePainter extends CustomPainter {
   final _Game game;
 
-  _GamePainter(this.game);
+  _GamePainter(this.game, {super.repaint});
 
   @override
   void paint(Canvas canvas, Size size) => game.draw(canvas);
@@ -880,6 +906,16 @@ class _Game {
   _Pt exit = _Pt(0, 0, 0);
   List<Offset> speckles = [];
 
+  /// The paper background and the whole track never change during a game.
+  /// Bake them into one picture on resize instead of re-drawing hundreds of
+  /// speckles, two gradients and 480 path segments every single frame.
+  ui.Picture? _staticPicture;
+  Path? _trackPathCache;
+
+  /// Reused for the short-lived effects so a frame does not allocate a
+  /// dozen Paint objects that the GC then has to clean up.
+  final Paint _scratchPaint = Paint();
+
   bool running = false;
   bool paused = false;
   bool over = false;
@@ -966,6 +1002,33 @@ class _Game {
       for (var i = 0; i < 260; i++)
         Offset(_rand.nextDouble() * w, _rand.nextDouble() * h),
     ];
+    _buildStatic();
+  }
+
+  void _buildStatic() {
+    _staticPicture?.dispose();
+    _staticPicture = null;
+    _trackPathCache = null;
+    try {
+      final recorder = ui.PictureRecorder();
+      _paintStatic(Canvas(recorder));
+      _staticPicture = recorder.endRecording();
+      _trackPathCache = _makeTrackPath();
+    } catch (_) {
+      // Headless/test canvas may refuse a recorder: draw directly instead.
+      _staticPicture = null;
+      _trackPathCache = null;
+    }
+  }
+
+  void _paintStatic(Canvas c) {
+    _paintBackground(c);
+    _paintTrack(c);
+  }
+
+  void dispose() {
+    _staticPicture?.dispose();
+    _staticPicture = null;
   }
 
   /// Point on the chosen track at progress [u] (0 = entry, 1 = exit).
@@ -1388,8 +1451,13 @@ class _Game {
 
   void draw(Canvas c) {
     _updateHover();
-    _drawBackground(c);
-    _drawTrack(c);
+    final staticPicture = _staticPicture;
+    if (staticPicture != null) {
+      c.drawPicture(staticPicture);
+    } else {
+      _paintBackground(c);
+      _paintTrack(c);
+    }
     _drawExit(c);
     // Hovered ball goes last, so its enlarged picture is never hidden by
     // the rest of the chain.
@@ -1401,34 +1469,43 @@ class _Game {
     }
     for (final corpse in corpses) {
       final a = (corpse.life / 0.28).clamp(0.0, 1.0);
-      final paint = Paint()
-        ..color = PaperTheme.ink.withValues(alpha: a * 0.7)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2;
-      c.drawCircle(Offset(corpse.x, corpse.y), corpse.r * (0.4 + 0.6 * a), paint);
+      c.drawCircle(
+        Offset(corpse.x, corpse.y),
+        corpse.r * (0.4 + 0.6 * a),
+        _scratchPaint
+          ..color = PaperTheme.ink.withValues(alpha: a * 0.7)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2,
+      );
     }
     for (final sh in shots) {
       c.save();
       c.translate(sh.x, sh.y);
       c.rotate(sh.angle);
       c.drawRRect(
-          RRect.fromRectAndRadius(
-              const Rect.fromLTWH(-12, -2.5, 20, 5), const Radius.circular(2)),
-          Paint()..color = PaperTheme.ink);
+        RRect.fromRectAndRadius(
+            const Rect.fromLTWH(-12, -2.5, 20, 5),
+            const Radius.circular(2)),
+        _scratchPaint
+          ..color = PaperTheme.ink
+          ..style = PaintingStyle.fill,
+      );
       c.restore();
     }
     for (final p in particles) {
       c.drawCircle(
         Offset(p.x, p.y),
         p.size,
-        Paint()..color = p.color.withValues(alpha: (p.life / 0.9).clamp(0.0, 1.0)),
+        _scratchPaint
+          ..color = p.color.withValues(alpha: (p.life / 0.9).clamp(0.0, 1.0))
+          ..style = PaintingStyle.fill,
       );
     }
     for (final s in shocks) {
       c.drawCircle(
         Offset(cx, cy),
         s.radius,
-        Paint()
+        _scratchPaint
           ..color = const Color(0xFF6F8F6A)
               .withValues(alpha: (s.life / 0.7).clamp(0.0, 1.0) * 0.6)
           ..style = PaintingStyle.stroke
@@ -1452,16 +1529,24 @@ class _Game {
       tp.paint(c, Offset(f.x - tp.width / 2, f.y));
     }
     if (flashRed > 0) {
-      c.drawRect(Offset.zero & Size(w, h),
-          Paint()..color = const Color(0xFF8F2F25).withValues(alpha: flashRed * 0.16));
+      c.drawRect(
+        Offset.zero & Size(w, h),
+        _scratchPaint
+          ..color = const Color(0xFF8F2F25).withValues(alpha: flashRed * 0.16)
+          ..style = PaintingStyle.fill,
+      );
     }
     if (flashCyan > 0) {
-      c.drawRect(Offset.zero & Size(w, h),
-          Paint()..color = const Color(0xFF6F8F6A).withValues(alpha: flashCyan * 0.2));
+      c.drawRect(
+        Offset.zero & Size(w, h),
+        _scratchPaint
+          ..color = const Color(0xFF6F8F6A).withValues(alpha: flashCyan * 0.2)
+          ..style = PaintingStyle.fill,
+      );
     }
   }
 
-  void _drawBackground(Canvas c) {
+  void _paintBackground(Canvas c) {
     c.drawRect(Offset.zero & Size(w, h), Paint()..color = PaperTheme.paper);
     final shader = RadialGradient(
       center: Alignment.center,
@@ -1494,7 +1579,7 @@ class _Game {
     c.drawRect(Offset.zero & Size(w, h), Paint()..shader = vignette);
   }
 
-  Path _trackPath() {
+  Path _makeTrackPath() {
     final p = Path();
     if (path.isEmpty) return p;
     p.moveTo(path.first.x, path.first.y);
@@ -1504,21 +1589,21 @@ class _Game {
     return p;
   }
 
-  void _drawTrack(Canvas c) {
-    final p = _trackPath();
-    final layers = <List<dynamic>>[
-      [64, const Color(0x55403B31)],
-      [56, const Color(0xFF9A917D)],
-      [50, const Color(0xFFC9BFA9)],
-      [44, const Color(0xFFE9E2D3)],
-      [38, const Color(0xFFD9D0BA)],
+  void _paintTrack(Canvas c) {
+    final p = _trackPathCache ?? _makeTrackPath();
+    const layers = <({double width, Color color})>[
+      (width: 64, color: Color(0x55403B31)),
+      (width: 56, color: Color(0xFF9A917D)),
+      (width: 50, color: Color(0xFFC9BFA9)),
+      (width: 44, color: Color(0xFFE9E2D3)),
+      (width: 38, color: Color(0xFFD9D0BA)),
     ];
     for (final layer in layers) {
       c.drawPath(
         p,
         Paint()
-          ..strokeWidth = (layer[0] as num).toDouble()
-          ..color = layer[1] as Color
+          ..strokeWidth = layer.width
+          ..color = layer.color
           ..style = PaintingStyle.stroke
           ..strokeCap = StrokeCap.round
           ..strokeJoin = StrokeJoin.round,
